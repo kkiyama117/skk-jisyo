@@ -56,7 +56,7 @@ tests/*.rs                  integration tests named by the cards
 
 `src/lib.rs` holds `pub mod model; pub use model::*;` and one `pub mod <name>;` line per module, which the card that adds the module appends.
 
-`tests/layers.rs` enforces the core rule in the gate. It reads each core source file with `include_str!` and asserts that none contains `crate::encoding`, `crate::text`, `crate::ime`, `crate::sync`, `crate::store`, `std::fs`, `std::time`, `std::env`, or `std::net`, and that none has a `use crate::{` group naming any of `encoding`, `text`, `ime`, `sync`, `store`. Each card that adds a core module adds its file to that list.
+`tests/layers.rs` enforces the core rule in the gate. It reads each core source file, including `src/model.rs`, with `include_str!` and asserts that none contains `crate::encoding`, `crate::text`, `crate::ime`, `crate::sync`, `crate::store`, `std::fs`, `std::time`, `std::env`, or `std::net`, and that none has a `use crate::{` group naming any of `encoding`, `text`, `ime`, `sync`, `store`. Each card that adds a core module adds its file to that list.
 
 ## Dependencies and licenses
 
@@ -126,6 +126,8 @@ impl Codec {
 | `EucJis2004` | 128 | 63 | 8,797 | 2,436 | 11,424 | 25 |
 | `EucJp` | 128 | 63 | 6,879 | 6,067 | 13,137 | 0 |
 
+The raw EUC-JIS-2004 file has 11,456 mappings. The Codec skips its 32 single-byte control-code rows 0x80 through 0x9F, so its accepted count is 11,424, as in the table above. J2 tests the accepted count, not the raw count. In the EUC-JP table, `8F A2 B7` is accepted and maps to U+FF5E; it is part of the expected 6,067 three-byte mappings, not an extra row to add to that count. J1 must verify the full generated counts and stop if they differ.
+
 No two codes in one table decode to the same string (a test checks this).
 
 ### EUC decode
@@ -166,7 +168,7 @@ Eleven of the 25 EUC-JIS-2004 pairs (0xABC4, 0xABC8, 0xABC9, 0xABCA, 0xABCB, 0xA
 - Then one line `0x%02X\tU+%04X` for each byte 0x00–0x7F, mapped to the same code point.
 - Then one line `0x%0NX\tU+%04X` (`N` is 4 or 6, uppercase hex, at least 4 hex digits of code point) for each candidate code that is kept. The candidates are `0x8E` + 0xA1..=0xFE, 0xA1..=0xFE × 0xA1..=0xFE, and `0x8F` + 0xA1..=0xFE × 0xA1..=0xFE. A code is kept when `iconv -f EUC-JP -t UTF-8` decodes it to exactly one character and `iconv -f UTF-8 -t EUC-JP` encodes that character back to the same bytes. Both checks are needed: with `-c`, iconv can skip a bad lead byte and decode the rest as another character.
 - Lines are in ascending order of the code as an unsigned integer. The file ends with a newline.
-- `python3 tools/gen-euc-jp.py` writes the file. `python3 tools/gen-euc-jp.py --check` builds the same text in memory and exits 1 if the file differs, else 0. The gate does not run the script, because the result depends on the glibc version.
+- `python3 tools/gen-euc-jp.py` writes the file. `python3 tools/gen-euc-jp.py --check` builds the same text in memory and exits 1 if the file differs, else 0. The gate never regenerates the real glibc table, because the result depends on the glibc version. Generator CLI tests run a copied script with a synthetic iconv double in a temporary directory.
 
 ## One entry line (`src/entry.rs`, core)
 
