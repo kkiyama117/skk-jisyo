@@ -9,7 +9,7 @@ Copied byte for byte from <http://x0213.org/codetable/euc-jis-2004-std.txt> on 2
     Copyright (C) 2006, 2009 Project X0213, All Rights Reserved.
     You can use, modify, distribute this table freely.
 
-Do not edit it. yaskkserv2 builds its EUC-JIS-2004 table from the same file, and the two agree on all 11,456 mapped codes.
+Do not edit it. yaskkserv2 builds its EUC-JIS-2004 table from the same file. The raw file has 11,456 mapped codes, including the 32 single-byte control codes 0x80 through 0x9F. Our Codec skips those 32 rows as SPEC.md "Tables" requires, leaving 11,424 accepted codes. J2 tests the Codec's 11,424 codes, not the raw count. The earlier comparison with yaskkserv2 covered the raw 11,456 mappings.
 
 ## euc-jp.txt
 
