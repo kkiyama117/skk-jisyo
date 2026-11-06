@@ -5,9 +5,9 @@
 `jisyo` is a Rust library and CLI for SKK dictionary data. It has two parts:
 
 1. **Formats.** Read and write SKK-JISYO text in EUC-JP, EUC-JIS-2004, UTF-8 (with or without BOM), and UTF-16LE (with BOM), so that reading a file and writing it back gives the same bytes. Turn a file into its meaning (a `Dict`) and a `Dict` into the user-dictionary file of CorvusSKK, fcitx5-skk, or skkeleton.
-2. **Store.** Keep the owner's user dictionary as one append-only log per machine in a folder that a file-sync tool copies between machines. Merging all logs gives the same `Dict` in any order. `sync` turns what an IME changed in its own file into log events, merges, and writes the merged dictionary back in that IME's format.
+2. **Store.** Keep an append-only local log of this machine's learning and a local cache of records fetched from a personal server. The own log also holds records waiting to be sent. Fetched records retain their original machine, sequence number, and time. Merging the records available locally gives the same `Dict` for the same record set in any arrival order. Offline input and learning use this local state without waiting for the server. The existing `sync` operation imports changes from a local IME file and exports a merged file; it is not network synchronization.
 
-The decisions above this spec are ADRs by `skk-design` (`/data/softwares/skk/docs/adr/`). The store part follows ADR-0006, and `skk-design` reviewed it on 2026-11-06 (`local/agents/jisyo-store-review-answer.md` in the parent repository). `LearnEvent`, `LearnOp`, and `LogRecord` are the learning events of ADR-0009: the engine's `Output::Learn` carries a `jisyo::LearnEvent`.
+The decisions above this spec are ADRs by `skk-design` (`/data/softwares/skk/docs/adr/`). ADR-0006 proposes a personal server and a local record cache; its transport details remain Proposed, not an owner-approved wire protocol. This store revision follows that proposal and ADR-0009 section 4. `LearnEvent`, `LearnOp`, and `LogRecord` retain their existing shapes. The engine's `Output::Learn` carries a `jisyo::LearnEvent`. The server protocol, authentication, encryption, delivery acknowledgments, single-writer enforcement, and machine-ID recovery need separate specifications and review before transport cards run.
 
 ## Layers
 
@@ -18,7 +18,7 @@ The code is split only where there are really two or more implementations. A lay
 | Core | `model`, `entry`, `dict`, `record`, `merge`, `diff` | Pure functions over the contract types, `&str`, and `&[u8]`. No files, no clock, no encoding tables, no knowledge of any IME. The engine will use this layer as it is: it emits `LearnEvent`s, and `merge` gives the user dictionary |
 | Formats | `encoding`, `text`, `ime` | Pure functions between bytes and the core types: the four encodings, the lossless file model, and one `Profile` per IME. A new encoding or a new IME changes this layer only |
 | Application | `sync` | The pure plan of one sync: given the bytes of every file and the time, return the bytes to write. All the guards live here |
-| Outside | `store`, `main` | The only code that touches the file system or the clock. It reads files, calls `sync::plan`, and writes the results. Another way to reach the synced folder changes this layer only |
+| Outside | `store`, `main`, future server transport | File-system access, the real clock, and future network I/O stay here. Local IME sync reads cached records, calls `sync::plan`, and writes its results. Server exchange is separate and must not block key processing or local learning. Core, Formats, and Application contain no network I/O |
 
 ## Owns, reads, writes
 
@@ -288,6 +288,12 @@ A `LearnEvent` is one thing the owner taught the dictionary, addressed to one ca
 
 One keystroke can teach several lists. Confirming 動く for `うごk` is a `Promote` of 動 in the main list and a `Promote` of 動 in block `く`. The engine emits both, in that order.
 
+**Promote producer contract.** For each target list `(section, midashi, okuri)`, the engine identifies the candidate by `word`. If that list in the user dictionary passed to the current `step` already contains the word, the event carries that candidate's complete current `word` and `annotation`. Otherwise it carries the selected lookup candidate, including its annotation. Displaying a candidate without annotations does not authorize dropping the annotation from the event. Preserve `None`, `Some("")`, and nonempty annotations as distinct values. Unknown or unrequested metadata must not be represented by `None`. An intentional annotation change or removal is an `Annotate`, not a side effect of selecting a candidate.
+
+Resolve the main-list and block-list payloads independently. If they hold different annotations for the same word, keep each value in its own `Promote`; do not copy one list's annotation over the other. Use the selected lookup candidate only for a target list that does not yet contain the word. This does not guarantee preservation of another machine's annotation that the producer has not fetched.
+
+`merge` and `apply` still apply the payload as written. They do not repair an incomplete producer payload by preserving an older annotation when the event says `None`. The engine's tests must check these production rules through public `step`; this crate's tests check the payload semantics through public `apply` and `merge`. No new engine lookup API is specified here.
+
 ### Record (`src/record.rs`, core)
 
 ```rust
@@ -323,7 +329,7 @@ A machine ID matches `^[a-z0-9][a-z0-9-]{0,31}$`. Otherwise the error is `bad-ma
 
 `parse_log(machine, bytes)`:
 
-- The complete part is the bytes up to and including the last `\n`, and `complete_len` is its length. The rest is a **partial tail**: a sync tool may have copied only part of the file. It is ignored, and `partial_tail` is set.
+- The complete part is the bytes up to and including the last `\n`, and `complete_len` is its length. The rest is a **partial tail**, which can result from an interrupted write. It is ignored for reading, and `partial_tail` is set. This is not permission to publish a partially received server response as a completed cache update. Receive validation and atomic cache publication belong to the future transport contract. Appending to an own log with a partial tail remains forbidden.
 - An empty complete part gives no records.
 - Otherwise the first line must be the header (else `log-header` line 1).
 - Each record line: invalid UTF-8, a field count other than 8, a machine field that is not `machine`, a bad number, op, section, or escape, or a field that breaks the field rules gives `log-syntax` with the line. A seq that is not the previous plus 1 gives `log-seq`. A time that is not greater than the previous gives `log-time`.
@@ -353,7 +359,7 @@ The result depends only on the set of records, never on their order. This is the
    - **text** is the latest record among `Add`, `Promote`, and `Annotate`. The candidate's annotation is that record's annotation.
    - An `Annotate` alone does not make a candidate present.
 4. **touch.** An entry's touch is the latest record of any op with its `(section, midashi)`. A block's touch is the latest record of any op with its `(section, midashi, Some(okuri))`. Deletes and annotates count, so purging a word also brings its entry to the front, as using one does. Entry and block order never changes what a lookup returns. It only changes the order of lines in an export and the order of completions, so an entry that comes to the front after a delete does no harm.
-5. Build the `Dict` from the present candidates. A list holds its candidates by rank, highest first. An entry's blocks are ordered by touch, latest first. Each section's entries are ordered by touch, latest first. An entry exists when it has at least one present candidate, and a block when it has one.
+5. Build the `Dict` from the present candidates. A list holds its candidates by rank, highest first. An entry's blocks are ordered by touch, latest first. Each section's entries are ordered by touch, latest first. A block exists exactly when its own list has a present candidate. An entry exists exactly when its main list has a present candidate or at least one of its blocks exists. Candidates inside blocks therefore count for entry existence. An entry with an empty main list and a nonempty block is retained. An entry with neither main candidates nor nonempty blocks is omitted.
 
 `apply(dict, event)` changes a `Dict` as one record later than every record behind it would. The engine's shell uses it to keep its in-memory dictionary current between merges (ADR-0009). In the event's section:
 
@@ -399,13 +405,14 @@ With `old` empty (the first import from an existing IME file), every event is `A
 pub struct SyncInput<'a> {
     pub machine: &'a str,
     pub target: Target,
-    pub logs: &'a [LogRecord],          // every machine's records, own log included
+    pub logs: &'a [LogRecord],          // records available locally, own log included
     pub own_log: Option<&'a [u8]>,      // the own log's bytes, None when the file is missing
     pub snapshot: Option<&'a [u8]>,
     pub seen: Option<&'a [u8]>,         // the IME file as the previous sync read it
     pub ime_file: Option<&'a [u8]>,
     pub max_deletes: u64,
     pub skip_unparsed: bool,
+    pub confirm_delivered_deletes: bool,
     pub now_ms: u64,
 }
 pub struct SyncReport { pub added: u64, pub promoted: u64, pub deleted: u64, pub annotated: u64, pub restored: u64, pub skipped: u64, pub bootstrap: bool }
@@ -421,7 +428,11 @@ pub fn export_bytes(target: Target, logs: &[LogRecord]) -> Result<(Vec<u8>, u64)
 3. If there is an IME file: `report = from_jisyo(&read(ime_file, None)?)`, `new = report.dict`. A snapshot without an IME file is `target-missing`. With neither, `old` and `new` are empty. An IME file without a snapshot sets `bootstrap`, and `old` is empty.
 4. **Unparsed guard.** If `report.other_lines` is not empty and `skip_unparsed` is false, return `unparsed` with the first line and the count. An entry that we cannot parse would otherwise look deleted.
 5. Without `p.blocks`, apply `without_blocks` to `old`, `new`, and the seen Dict below. `events = diff(&old, &new)`.
-6. **Restore guard.** The worst failure is an IME that saves its in-memory dictionary over our export without reloading it first. The words we had just delivered would then look deleted, and the deletes would spread to every machine. So: the **delivered** keys are the `(section, midashi, okuri, word)` keys of `old` that are not in `seen` (`from_jisyo(&read(seen, None)?).dict`). With a snapshot but no `seen`, every key of `old` counts as delivered. Drop every `Delete` event whose key is delivered, and count each in `restored`. The merge still has those words, so the output gives them back to the IME. If the owner really purged such a word right after it arrived, it comes back once, and the next purge is recorded, because by then it is in `seen`.
+6. **Restore guard and explicit deletion confirmation.** The **delivered** keys are the `(section, midashi, okuri, word)` keys of `old` that are not in `seen` (`from_jisyo(&read(seen, None)?).dict`). With a snapshot but no `seen`, every key of `old` counts as delivered. By default `confirm_delivered_deletes` is false. Drop each diff-produced `Delete` whose key is delivered, and count it in `restored`. The absence creates no new Delete; the output follows the retained records and restores the candidate if it is still present in their merged state. When `confirm_delivered_deletes` is true, keep those actual diff-produced deletes and do not count them in `restored`. This confirmation creates no delete for a key that is not missing from `new`; step 7 still checks all retained deletes.
+
+   `confirm_delivered_deletes` is an explicit user assertion that the currently missing delivered candidates were intentionally purged. The CLI sets it only for the current invocation's `--confirm-delivered-deletes`; it is false without that flag and is never persisted as a default. Automated watchers, repeated missing observations, file timestamps, retry counts, and server arrivals must not set it. The library caller has the same obligation to obtain explicit user intent for the current diff.
+
+   A stale IME can repeatedly save the same missing-word file that an intentional repeated purge produces. With the same logs, snapshot, seen, and IME bytes, a file-only importer cannot distinguish those histories. Therefore an unconfirmed absence stays protected even on the second or later sync. Seeing the word absent twice is not confirmation. Do not claim that the word returns only once or that the second legacy-IME `X` alone is observable as intent. To complete a repeated purge before any sync has read the word in the IME file, the owner confirms that purge with the flag while the IME file still lacks the word. The resulting `Delete` is appended even though `seen` never contained it. A later purge after a sync has actually read the word in `seen` needs no special confirmation. An engine event with `op = LearnOp::Delete` is direct learning, not an absence inferred from an IME file, and is not filtered by this import guard.
 7. **Delete guard.** If the number of `Delete` events left is greater than `max_deletes`, return `too-many-deletes` with the number. The CLI default is 10. This is the last net behind the restore guard.
 8. `appended = append_bytes(machine, own_log, &events, next_time(now_ms, logs))`.
 9. `merge` of `logs` plus `appended.records`, then `render` with `p`, then `write`. That is `output`. `skipped` is the render's count.
@@ -432,17 +443,19 @@ pub fn export_bytes(target: Target, logs: &[LogRecord]) -> Result<(Vec<u8>, u64)
 ### Store (`src/store.rs`, outside)
 
 ```
-<store>/logs/<machine>.log                 one per machine, synced
-<store>/state/<machine>/<target>.jisyo       the last export for one target (the snapshot), written only by <machine>
-<store>/state/<machine>/<target>.seen.jisyo  the IME file as the last sync read it, written only by <machine>
+<store>/logs/<machine>.log                 own append-only log or cached records of another machine
+<store>/state/<machine>/<target>.jisyo       local last export for one target (the snapshot)
+<store>/state/<machine>/<target>.seen.jisyo  local IME file as the last sync read it
 ```
 
-`<target>` is `target_name(target)`. The sync tool may copy `state/` too. That does no harm, because only `<machine>` reads and writes its own folder.
+`<target>` is `target_name(target)`. The Store's configured machine is the only producer of new records in its own log. That log is both local learning history and the outbox for future server delivery. Sending or acknowledging records does not delete or rewrite them. Each other `<id>.log` contains records fetched for that original machine, preserving every `machine`, `seq`, `time`, and event field. Storing such a replica does not authorize generating new learning under that machine's ID or restamping records on arrival. The local union of own and fetched records is the cache used for offline lookup, export, and IME sync. Records that have never been fetched are unavailable offline.
+
+Snapshots and seen files are local bridge state for the configured machine and target. They are not learning records, are not uploaded to the server, and are not treated as another machine's learning. No shared folder or external folder-copy tool is required. Cache downloads and local IME `sync` are distinct operations. The initial policy keeps all complete records, including deletes and records already acknowledged by the server; compaction and ID recovery need separate contracts.
 
 ```rust
 pub struct Store { /* dir, machine */ }
 pub struct Logs { pub records: Vec<LogRecord>, pub ignored_files: u64, pub partial_tails: u64 }
-pub struct SyncOptions { pub target: Target, pub file: PathBuf, pub max_deletes: u64, pub skip_unparsed: bool, pub dry_run: bool }
+pub struct SyncOptions { pub target: Target, pub file: PathBuf, pub max_deletes: u64, pub skip_unparsed: bool, pub confirm_delivered_deletes: bool, pub dry_run: bool }
 pub struct SyncDone { pub report: SyncReport, pub written: bool }
 impl Store {
     pub fn open(dir: &Path, machine: &str) -> Result<Store, Error>; // validates the ID, creates logs/ and state/<machine>/
@@ -456,11 +469,11 @@ impl Store {
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error>;
 ```
 
-`read_logs` reads every regular file in `logs/` whose name is `<id>.log` with a valid ID, through `parse_log(id, ...)`. Any other file adds 1 to `ignored_files`, which covers sync-tool conflict copies and temporary files. Each partial tail adds 1 to `partial_tails`.
+`read_logs` reads every regular file in `logs/` whose name is `<id>.log` with a valid ID, through `parse_log(id, ...)`. This includes the own log and cached other-machine logs. It performs no server request and never changes record identity, payload, or time. Any other file adds 1 to `ignored_files`, covering temporary or unrelated files without assuming an external synchronization tool. Each partial tail adds 1 to `partial_tails`. Reading a partial own log does not authorize a later append to it; `append_bytes` still returns `partial-tail`.
 
 `sync`:
 
-1. Read the logs, the own log's bytes, the snapshot, the seen file, and the IME file (a missing file is `None`). Build `SyncInput` with `clock.now_ms()`, and call `plan`. On error, write nothing.
+1. Read the locally cached logs, the own log's bytes, the snapshot, the seen file, and the IME file (a missing file is `None`). Build `SyncInput` with `clock.now_ms()` and this invocation's options, including `confirm_delivered_deletes`, and call `plan`. On error, write nothing. Do not contact the server or wait for an acknowledgment.
 2. With `dry_run`, return the report with `written` false. Write nothing.
 3. Append `log_append` to the own log: open for append (create if missing), one `write_all`, `sync_all`.
 4. Write the IME file with `write_atomic` unless its bytes already equal `output`. Set `written`.
@@ -475,6 +488,112 @@ The order matters. If the process stops between steps 4 and 5, the next sync see
 
 `repair_log`: if the own log is missing, empty, or ends with `\n`, return 0. Otherwise truncate it after its last `\n` (or to 0 bytes when it has none), `sync_all`, and return the number of bytes removed.
 
+### Server-exchange boundary
+
+Network exchange is not part of `Store::sync`, `sync::plan`, or the current CLI commands. A future outside adapter sends the own records and fetches other machines' records. The server retains their union by `(machine, seq)`, accepts an identical retransmission once, and rejects different contents under the same ID with `log-conflict`. Neither download time nor server arrival order replaces a record's original time. The existing `(time, machine, seq)` order decides presence, annotation, rank, and touch everywhere.
+
+The own log remains durable local history and outbox during disconnection and after acknowledgment. Do not claim a record is sent before the receiver has durably stored it. Delivery positions may reduce retransmission but do not change record identity. Do not delete records after sending. A cache update preserves previously accepted records and rejects conflicting replacements instead of overwriting them. The future receive contract must specify assembling and validating complete per-machine prefixes and atomic publication; a cut response is not a completed cached log. The own log's producer remains the local machine, not the download adapter. Recovery of a lost own log or reuse of a machine ID needs a separate specification.
+
+Only available records participate while offline. Two machines can temporarily have different dictionaries. Once they have the same record set, their dictionaries must be equal regardless of fetch, send, retry, duplicate, or disconnect order. No server round trip is required for local learning. No server endpoint, wire format, authentication scheme, acknowledgment format, or new transport API is selected by this spec revision. Those require their own cards and review. This design does not authorize an external conversion API to receive dictionary or typed text.
+
+### Required store-contract tests
+
+These are test specifications for future implementation cards, not executable tests added by this document or evidence that the behavior already passes. Each name below is a separate test function. Pure behavior goes through public `merge`, `apply`, or `sync::plan`; file behavior goes through public Store methods or the CLI in a unique temporary directory. Tests use only literal synthetic data. Pure tests pass explicit times, Store tests inject a Clock, and CLI tests check only the specified time ordering rather than an exact wall-clock value. Expected values come from the literal rules below, never another call to the function under test. No test uses the network. Sender/receiver I/O tests wait for the separately reviewed transport API.
+
+#### Entry existence (`tests/merge.rs`)
+
+Let R contain two records from machine `a`: seq 1 at time 10 adds word `A` without annotation to main list `(OkuriAri, "k", None)`; seq 2 at time 20 adds word `A` without annotation to block list `(OkuriAri, "k", Some("u"))`. Record r is seq 3 at time 30, deleting main-list word `A`. The expected result after r is a literal Dict with one ari entry `k`, empty main candidates, and one block `u` containing candidate `A` with annotation None. All other lists are empty.
+
+| Test | Observable assertion |
+|---|---|
+| `merge_block_candidates_keep_entry` | Merge machine a, seq 1/time 10 Add word A with annotation None to block `(OkuriAri, k, Some(u))`; expect that literal block-only Dict |
+| `merge_main_delete_keeps_block_entry` | Merge R plus r; expect the same literal block-only Dict |
+| `apply_rule_main_delete_keeps_block_entry` | Obtain the starting Dict with public merge(R), then apply r.event; expect the literal block-only Dict, not an expected value computed with merge(R plus r) |
+| `merge_last_block_delete_removes_entry` | Use machine a, seq 1/time 10 Add ari k/block-u/A and seq 2/time 20 Delete that block candidate, with annotation None in both. Expect the literal empty Dict |
+| `apply_last_block_delete_removes_entry` | Starting from the literal block-only Dict, apply a Delete for block word A; expect the literal empty Dict |
+
+The middle two tests establish the required apply/merge equality against an independent common expected value. They must not merely compare two implementation outputs that could share the same defect.
+
+#### Promote payloads (`tests/merge.rs`)
+
+For apply tests, the starting literal Dict has one nasi entry `k`, candidates `[A with annotation None, B with annotation Some("before")]`, and no blocks. Apply a Promote for B carrying V. Expect the literal Dict with candidates `[B with V, A with None]`. For merge tests, use machine `a` records seq 1/time 10 Add A with None, seq 2/time 20 Add B with Some("before"), seq 3/time 30 Promote B with V. Expect the same literal result. These test the consumer's payload semantics even when its previous annotation differs from the event's value; they are not examples of the engine choosing a payload from that starting Dict. Producer selection is tested in the engine's public step tests under ADR-0009.
+
+| Test | V and expected B annotation |
+|---|---|
+| `apply_promote_nonempty_annotation` | Some("note") |
+| `merge_promote_nonempty_annotation` | Some("note") |
+| `apply_promote_none_annotation` | None, not the older Some("before") |
+| `merge_promote_none_annotation` | None, not the older Some("before") |
+| `apply_promote_empty_annotation` | Some(""), distinct from None |
+| `merge_promote_empty_annotation` | Some(""), distinct from None |
+
+For the following tests the literal starting ari entry `k` has main candidate A with Some("main") and block u containing A with Some("block"). The merge fixture uses machine a, seq 1/time 10 Add main A with Some("main"), seq 2/time 20 Add block-u A with Some("block"), seq 3/time 30 Promote main A with Some("main"), and seq 4/time 40 Promote block-u A with Some("block").
+
+| Test | Observable assertion |
+|---|---|
+| `apply_main_promote_preserves_block_annotation` | Apply main-list Promote A with Some("main"); the resulting main annotation is Some("main") and the untouched block annotation is Some("block") |
+| `apply_block_promote_preserves_main_annotation` | Apply block-u Promote A with Some("block"); the block annotation is Some("block") and the untouched main annotation is Some("main") |
+| `merge_promotes_keep_per_list_annotations` | Add both literal candidates, then issue the main Promote and block Promote in that order at later times; expect the literal entry with the two distinct annotations |
+
+#### IME deletion confirmation (`tests/sync.rs`)
+
+Use target Skkeleton and machine `a`. Let E be the literal bytes `b";; okuri-ari entries.\n;; okuri-nasi entries.\n"`. Let P be E followed by `b"k /A/\n"`. Let L be the literal own-log bytes `b"jisyo-log 1\na\t1\t10\tadd\tnasi\tk\t\tA\n"`, and let the input records be the corresponding literal Add record. Default options for these fixtures are max_deletes 10, skip_unparsed false, and confirm_delivered_deletes false. Supply every byte slice and every record explicitly; do not generate expected bytes with a jisyo formatter.
+
+The two-cycle fixture calls plan at time 20 with own log L, snapshot P, seen E, and IME file E. Apply all returned planned writes to the test's synthetic state, including the log append, snapshot output, and observed seen bytes. Before the second call, simulate another purge or stale overwrite by putting E in the IME file again. No call has read P as the IME file. Call plan again at time 30 with that state. This is a public plan replay; the expected bytes below remain literals, not the first call's output used as an oracle.
+
+| Test | Observable assertion |
+|---|---|
+| `plan_first_unconfirmed_absence_is_restored` | One call with L/P/E/E and time 20 produces empty log_append, restored 1, deleted 0, and output P |
+| `plan_seen_is_observed_input_not_export` | The same call returns seen Some(E), not Some(P) |
+| `plan_repeated_stale_overwrite_stays_protected` | Replay both cycles without confirmation; the second call still has empty log_append, restored 1, deleted 0, and output P |
+| `plan_repeated_purge_confirmed_without_seen_presence` | Replay both cycles, setting confirmation true only on the second. The second log_append is exactly `b"a\t2\t30\tdelete\tnasi\tk\t\tA\n"`, deleted is 1, restored is 0, and output is E. A parsed own log after this append has the literal Add and Delete records; it must not contain a Promote or a restamped record |
+| `plan_observed_word_purge_needs_no_confirmation` | With snapshot P, seen P, IME E, L, and time 30, default confirmation false gives the same literal Delete append and output E |
+| `plan_confirmation_creates_no_missing_diff` | With L/P/E/P and confirmation true, log_append is empty and output is P; confirmation alone creates no Delete |
+| `plan_confirmation_keeps_delete_limit` | With L/P/E/E at time 30, confirmation true and max_deletes 0 returns TooManyDeletes with count Some(1), not a successful plan |
+| `plan_confirmation_keeps_unparsed_guard` | With L/P/E and IME bytes `b"junk\n"`, confirmation true and skip_unparsed false returns Unparsed with line Some(1) and count Some(1) |
+
+Must fail without: the restore guard for unconfirmed delivered keys → `plan_first_unconfirmed_absence_is_restored`, `plan_repeated_stale_overwrite_stays_protected`.
+Must fail without: recording the observed IME bytes rather than the export in seen → `plan_seen_is_observed_input_not_export`.
+Must fail without: the explicit-confirmation exception for actual diff deletes → `plan_repeated_purge_confirmed_without_seen_presence`.
+Must fail without: the delete-count guard after confirmation → `plan_confirmation_keeps_delete_limit`.
+Must fail without: the unparsed-line guard → `plan_confirmation_keeps_unparsed_guard`.
+
+#### Local cache and outbox (`tests/store.rs`, `tests/merge.rs`)
+
+Each file test uses a new temporary Store directory. A cached log for machine b has literal bytes `b"jisyo-log 1\nb\t1\t5\tadd\tnasi\tremote\t\tB\n"`. Its record has exactly machine b, seq 1, time 5, Add, OkuriNasi, midashi remote, okuri None, candidate B with annotation None. No server or engine process is started.
+
+| Test and file | Observable assertion |
+|---|---|
+| `store_cached_record_keeps_identity`, tests/store.rs | Seed b.log, open Store for machine a, and call read_logs. Its record set equals the one literal b record with original machine, seq, time, and event, not a newly generated a record |
+| `store_offline_export_uses_cached_records`, tests/store.rs | With only that cached log, export Skkeleton to a temporary file. Its bytes are exactly E followed by `b"remote /B/\n"`; no own learning or server access is required |
+| `store_local_learning_survives_reopen_as_outbox`, tests/store.rs | With b.log present and no own log or snapshot, seed an IME file E followed by `b"local /A/\n"`, run local Store::sync for a with clock 10 and default options, and reopen Store. The own log still has exact bytes `b"jisyo-log 1\na\t1\t10\tadd\tnasi\tlocal\t\tA\n"`. Local sync never sends, acknowledges, or removes it |
+| `store_local_sync_does_not_rewrite_cached_machine`, tests/store.rs | The same local sync leaves the original b.log bytes unchanged |
+| `store_partial_own_log_blocks_append`, tests/store.rs | Seed own-log bytes L followed by `b"a\t2"`, snapshot P, seen P, and IME E. Use clock 20 and default confirmation false, so the observed ordinary purge produces a Delete before append validation. Sync returns PartialTail and leaves the own log, IME, snapshot, and seen bytes unchanged |
+| `store_confirmation_dry_run_writes_nothing`, tests/store.rs | Seed L/P/E/E, set confirmation true, clock 30, and dry_run true. The returned report has deleted 1 and written false, while all four input files remain byte-for-byte unchanged |
+
+For the following merge tests, use literal records a1/time 10 Add nasi k/A, a2/time 30 Delete k/A, b1/time 20 Add k/B, and b2/time 40 Promote k/A with Some("remote"). Unspecified annotations are None and all okuri are None. The literal expected Dict is one nasi entry k with candidates `[A with Some("remote"), B with None]`, no blocks, and no ari entries.
+
+| Test | Observable assertion |
+|---|---|
+| `merge_offline_histories_converge_after_reconnect` | Deliver the two complete machine histories in either order and each permutation of the four records to public merge. Every result equals the literal expected Dict, not an expected value computed by merging a preferred order |
+| `merge_retransmission_is_idempotent` | Include identical duplicates of all four records; expect the same literal Dict |
+| `merge_same_identity_different_payload_conflicts` | Supply b1 twice, once with its literal word B and once with word C, keeping every other field identical; expect LogConflict, not replacement by arrival order |
+
+Receiver persistence before acknowledgment, interrupted downloads, transport retry scheduling, authentication, and machine-ID recovery need separate tests through the future transport's public interface after that interface is specified. The local tests above do not claim those network behaviors have been implemented or verified.
+
+#### CLI confirmation (`tests/cli.rs`)
+
+Run the real CLI only against the test's temporary files, using the deletion fixture's literal bytes; never invoke the owner's IME paths. Do not assert a particular wall-clock time. For the new seq-2 record after L, assert the literal event payload and sequence and a time strictly greater than the previous literal time 10. Do not call next_time to manufacture an expected timestamp or merge to manufacture an expected dictionary.
+
+| Test | Observable assertion |
+|---|---|
+| `cli_sync_defaults_to_restore_protection` | Omit --confirm-delivered-deletes with L/P/E/E. The command reports restored 1 and deleted 0 and leaves the own log L unchanged |
+| `cli_sync_confirms_repeated_purge` | First run without confirmation to restore A, then put E back in the IME file without any intervening sync read of P. Run with --confirm-delivered-deletes. The own log gains exactly one seq-2 Delete for k/A, output is E, and the report has deleted 1 and restored 0 |
+| `cli_confirmation_is_not_persisted` | After a confirmed invocation, seed a newly delivered word B via a b/seq-1/time-60 Add record, snapshot E plus `b"k /B/\n"`, seen E, and IME E. Invoke sync without the flag. It restores B and adds no Delete for B; an earlier flag must not become a stored automatic default |
+
+Must fail without: refusing an append to a partial own log → `store_partial_own_log_blocks_append`.
+Must fail without: requiring the explicit CLI flag before confirming delivered deletes → `cli_sync_defaults_to_restore_protection`.
+
 ### Operating notes (for PLAN step 4, not for cards)
 
 - An IME holds its dictionary in memory and rewrites the whole file. After `sync` writes the IME file, the IME must reload it before it saves again. skkeleton reloads when the file's mtime changes. libskk reloads when the ETag changes, and a stale ETag makes its save fail rather than overwrite. CorvusSKK's `imcrvmgr.exe` must be stopped before the file is written. The restore and delete guards are the safety net, not the plan.
@@ -485,10 +604,12 @@ The order matters. If the process stops between steps 4 and 5, the next sync see
 
 ```
 jisyo check <file> [--encoding euc-jp|euc-jis-2004|utf-8|utf-16le]
-jisyo sync --store <dir> --machine <id> --target corvus|fcitx5|skkeleton --file <path> [--max-deletes <n>] [--skip-unparsed] [--dry-run]
+jisyo sync --store <dir> --machine <id> --target corvus|fcitx5|skkeleton --file <path> [--max-deletes <n>] [--skip-unparsed] [--confirm-delivered-deletes] [--dry-run]
 jisyo export --store <dir> --target corvus|fcitx5|skkeleton --out <path>
 jisyo repair-log --store <dir> --machine <id>
 ```
+
+`sync` is local IME reconciliation against the cached records, not a request to contact the server. `--confirm-delivered-deletes` defaults to false and applies only to the current invocation's actual diff. Use it only to confirm intentional purges of delivered candidates still missing from the IME file; never add it to an automatic watcher. It does not bypass --max-deletes, the unparsed-line guard, or --dry-run. A confirmed dry run reports the deletes that would be recorded and writes nothing. No confirmation is saved for a later invocation.
 
 Output goes to stdout, one `<name> <value>` line per item, and contains only counts and names:
 
