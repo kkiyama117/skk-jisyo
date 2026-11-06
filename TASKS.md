@@ -27,7 +27,7 @@ Write `tools/gen-euc-jp.py` exactly as the SPEC subsection says. Use only the Py
 Rules:
 
 - With no arguments, the script writes `data/euc-jp.txt`, relative to the repository root, which is the parent of the script's own directory (`Path(__file__).resolve().parent.parent`). It prints one line, `wrote <n> mappings`, where `<n>` counts the mapping lines (no header lines).
-- With `--check`, it writes nothing. It exits 0 when the file equals the text it would write, else it prints `data/euc-jp.txt is out of date` and exits 1.
+- With `--check`, it writes nothing. It exits 0 with empty stdout and stderr when the file equals the text it would write. Otherwise it prints `data/euc-jp.txt is out of date\n` to stderr, leaves stdout empty, and exits 1.
 - Any other argument: print `usage: gen-euc-jp.py [--check]` to stderr and exit 2.
 - For decoding, send each candidate followed by one literal LF byte to `iconv -c -f EUC-JP -t UTF-8`. For the reverse check, batch only the decoded strings that contain exactly one character, each followed by one LF, through `iconv -c -f UTF-8 -t EUC-JP`. Keep the original candidate associated with each reverse-check input.
 - In both directions, accept an iconv return code of 0 or 1 only when stderr is empty and the output framing is intact. Code 1 can report skipped invalid input even with `-c`. Any other return code, nonempty stderr, or broken framing means stop and report, without writing the table.
@@ -52,33 +52,34 @@ Real-iconv checks, which the worker runs and pastes into the report. These host 
 | `grep -c $'^0x8FA2B7\t' data/euc-jp.txt` | `1`, exit 0; the row is `0x8FA2B7\tU+FF5E` |
 | `grep -c $'^0x8FB0A1\t' data/euc-jp.txt` | `1`; the row is `0x8FB0A1\tU+4E02` |
 
-The seven sample rows above use `\t` to mean one literal tab. Check their full contents and their order as well as the counts. The expected total remains 13,137 mappings and 13,139 file lines. The U+FF5E row is included in the expected 6,067 three-byte mappings. Do not increment any total just because the erroneous negative check was corrected. The full generator run must confirm those totals.
+The seven sample rows above use `\t` to mean one literal tab. Check their full contents and their positions in ascending unsigned-integer code order, not lexicographic hex-string order. The sample order is `0x41 < 0x8EB1 < 0xA1B1 < 0xA1BD < 0xA4A2 < 0x8FA2B7 < 0x8FB0A1`, which is also the current table order. For example, the three-byte integer 0x8FA2B7 is greater than the two-byte integer 0xA4A2 even though its hex text begins with 8. The expected total remains 13,137 mappings and 13,139 file lines. The U+FF5E row is included in the expected 6,067 three-byte mappings. Do not increment any total just because the erroneous negative check was corrected. The full generator run must confirm those totals.
 
 ### Generator CLI tests
 
 Put these Rust integration tests in `tests/gen_euc_jp.rs`. They invoke `python3 -I` on a copy of the generator in a `tempfile` directory with `tools/` and `data/` children. Set the child process's working directory to a different temporary directory. Never regenerate the checkout's real table during the gate. These developer-tool tests are Unix-only with `#[cfg(unix)]`, because this generator requires the glibc iconv development environment; this does not restrict the Rust library.
 
-Use `testdata/iconv-double.py` as the child process's `iconv`, copied to a temporary executable named `iconv` at the front of that child's PATH. The double uses the Python standard library and accepts `-c -f EUC-JP -t UTF-8` and the reverse options. It processes only literal-LF-separated records in memory. Its default synthetic forward mappings are `A4 A2` to U+3042, `FE FE` to U+20089, `A4 A3` to the two characters `xy`, and `8E B1` to U+FF71. Other candidate codes give an empty record. Its reverse mappings are U+3042 to `A4 A2`, U+20089 to `FE FE`, and U+FF71 to `8E B2`, deliberately different from the forward code. It preserves every LF, returns 1 with empty stderr when it skipped anything, otherwise 0. It never opens dictionary files. Only the double reads `JISYO_TEST_ICONV_FAULT`, with values `exit2`, `stderr`, `missing-lf`, or `extra-line`; the production generator must not read this variable. Each value changes only that one property in the forward result: exit 2, stderr `synthetic failure\n`, removal of the final LF, or one extra LF respectively.
+Use `testdata/iconv-double.py` as the child process's `iconv`, copied to a temporary executable named `iconv` at the front of that child's PATH. The double uses the Python standard library and accepts `-c -f EUC-JP -t UTF-8` and the reverse options. It processes only literal-LF-separated records in memory. Its default synthetic forward mappings are `A4 A2` to U+3042, `FE FE` to U+20089, `A4 A3` to the two characters `xy`, and `8E B1` to U+FF71. Other candidate codes give an empty record. Its reverse mappings are U+3042 to `A4 A2`, U+20089 to `FE FE`, the complete two-character record `xy` to `A4 A3`, and U+FF71 to `8E B2`, deliberately different from the forward code. Mapping `xy` back to A4A3 is intentional: reverse-byte equality must not mask removal of the single-character eligibility check. That eligibility check is the filter before the reverse batch; do not add a second eligibility filter inside the reverse conversion. It preserves every LF, returns 1 with empty stderr when it skipped anything, otherwise 0. It never opens dictionary files. Only the double reads `JISYO_TEST_ICONV_FAULT`, with values `exit2`, `stderr`, `missing-lf`, or `extra-line`; the production generator must not read this variable. Each value changes only that one property in the forward result: exit 2, stderr `synthetic failure\n`, removal of the final LF, or one extra LF respectively.
 
 | Test | Assert through the generator CLI |
 |---|---|
 | `gen_writes_at_script_root` | With the default double, generation exits 0, prints `wrote 130 mappings\n`, and creates `data/euc-jp.txt` beside the copied tools directory, not under the process working directory |
 | `gen_header` | The generated file starts with exactly the two header lines in the SPEC |
 | `gen_ascii_identity` | All 128 ASCII rows are exactly `0x00\tU+0000` through `0x7F\tU+007F` |
-| `gen_order_and_hex_width` | The generated rows end with `0xA4A2\tU+3042\n0xFEFE\tU+20089\n`, after the ASCII rows |
+| `gen_row_order` | Reading only the code column as integers gives the ordered sequence 0x00 through 0x7F, then 0xA4A2, then 0xFEFE; this test does not inspect code-point spelling |
+| `gen_codepoint_hex_width` | Looking up rows by their code, independently of row order, finds code-point fields `U+0000` for 0x00, `U+3042` for 0xA4A2, and `U+20089` for 0xFEFE |
 | `gen_keeps_empty_record_positions` | The empty outputs preceding A4A2 do not shift its association; the output contains exactly `0xA4A2\tU+3042` for that code |
-| `gen_rejects_multi_character` | No row for A4A3 appears |
+| `gen_rejects_multi_character` | Generation exits 0 and no row for A4A3 appears, even though the double maps its complete decoded record `xy` back to A4A3; with the single-character filter removed, this test must fail rather than rely on reverse-byte equality to reject it |
 | `gen_rejects_reverse_mismatch` | No row for 8EB1 appears |
-| `gen_check_matches` | Against a previously generated synthetic file, `--check` exits 0 and leaves its bytes and modification time unchanged |
-| `gen_check_missing` | With no output file, `--check` exits 1, prints `data/euc-jp.txt is out of date\n`, and creates no file |
-| `gen_check_differs` | With an output containing only `sentinel\n`, `--check` exits 1, prints `data/euc-jp.txt is out of date\n`, and preserves the sentinel |
+| `gen_check_matches` | Seed the output with independently assembled expected bytes: the two literal SPEC headers, 128 ASCII identity rows, `0xA4A2\tU+3042\n`, then `0xFEFE\tU+20089\n`. Do not run the generator to make this fixture. `--check` exits 0 with empty stdout and stderr and leaves its bytes and modification time unchanged |
+| `gen_check_missing` | With no output file, `--check` exits 1, stdout is empty, stderr is `data/euc-jp.txt is out of date\n`, and no file is created |
+| `gen_check_differs` | With an output containing only `sentinel\n`, `--check` exits 1, stdout is empty, stderr is `data/euc-jp.txt is out of date\n`, and the sentinel is preserved |
 | `gen_bad_argument` | `--unknown` exits 2 and stderr is `usage: gen-euc-jp.py [--check]\n`; no output file is created |
 | `gen_rejects_iconv_exit2` | With `exit2` and a pre-existing sentinel output, generation exits 1 and leaves the sentinel unchanged |
 | `gen_rejects_iconv_stderr` | With `stderr` and a sentinel output, generation exits 1 and leaves the sentinel unchanged |
 | `gen_rejects_missing_lf` | With `missing-lf` and a sentinel output, generation exits 1 and leaves the sentinel unchanged |
 | `gen_rejects_extra_line` | With `extra-line` and a sentinel output, generation exits 1 and leaves the sentinel unchanged |
 
-A conversion failure prints `error: iconv\n` to stderr and exits 1, without writing a table or printing the double's stderr. Each failure test asserts that stderr, empty stdout, and the preserved sentinel in addition to the exit code. Every successful-generation test invokes the CLI in the test body and first asserts exit 0, before opening the result file. Fixture setup only copies the script and double and prepares directories or sentinels; it must not generate the table. No reverse candidates means skip that empty batch, not a framing failure.
+A conversion failure prints `error: iconv\n` to stderr and exits 1, without writing a table or printing the double's stderr. Each failure test asserts that stderr, empty stdout, and the preserved sentinel in addition to the exit code. Every successful-generation test invokes the CLI in the test body and first asserts exit 0, before opening the result file. Fixture setup only copies the script and double and prepares directories or independently specified files; it must not run the generator to make expected data. No reverse candidates means skip that empty batch, not a framing failure.
 
 Must fail without: the exactly-one-character check → `gen_rejects_multi_character`.
 Must fail without: reverse-byte equality → `gen_rejects_reverse_mismatch`.
@@ -206,7 +207,8 @@ Each rejection test calls `parse_entry(content, section)` and asserts `None`:
 | `reject_stray_close` | `おおk /]/` | ari | `]` outside a block |
 | `reject_empty_okuri` | `おおk /[/多/]/` | ari | empty okuri |
 | `reject_nested_block` | `おおk /[く/[多/]/` | ari | block candidate starts with `[` |
-| `reject_close_in_okuri` | `おおk /[く]/` | ari | okuri contains `]` |
+| `reject_close_in_okuri` | `おおk /[く]/多/]/` | ari | okuri `く]` contains `]`; the block has a candidate and a separate closing token |
+| `reject_open_in_okuri` | `おおk /[く[/多/]/` | ari | okuri `く[` contains `[`; the block has a candidate and a separate closing token |
 
 For each candidate case below, write separate `parse_candidate_<case>` and `format_candidate_<case>` tests. Use the literal Candidate as the expected parse result and the literal string as the expected formatted result. Do not obtain the format fixture by parsing.
 
@@ -216,6 +218,9 @@ For each candidate case below, write separate `parse_candidate_<case>` and `form
 | `empty_annotation` | `"a;"` | `c(a; "")` |
 | `first_semicolon` | `"a;b;c"` | `c(a; b;c)` |
 | `empty_word` | `""` | `c("")` |
+
+Must fail without: rejecting `]` inside block okuri → `reject_close_in_okuri`.
+Must fail without: rejecting `[` inside block okuri → `reject_open_in_okuri`.
 
 Done: `make check` exits 0.
 
@@ -317,13 +322,22 @@ The edge fixture has exactly 11 lines. In the expected entries above, candidates
 
 The following generator-CLI tests also go in `tests/round_trip.rs`. Run `python3 -I` on a copy of gen-testdata.py under a temporary `tools/` directory. Every test gets its own temporary directory and runs from a different working directory. It never writes the checkout's testdata.
 
+Build the expected bytes independently in the test code, before invoking the generator. Embed a literal copy of B, including its final LF, and the literal cookie lines, extra lines, and complete edge text from the Test data section. Do not read TASKS.md at runtime. For each filename, assemble exactly the text in that section's file table. Obtain UTF-8 bytes with Rust's standard library. Obtain UTF-16LE bytes with its standard-library encode_utf16, prefix literal FF FE, and use CRLF for every newline. For EUC-JP and EUC-JIS-2004 only, pass the independently assembled literal UTF-8 text on stdin to a separate `python3 -I` process that uses only the standard-library `euc_jp` or `euc_jis_2004` codec, capturing its bytes. This reference process must not import, execute, or parse gen-testdata.py, any other project module, or jisyo. Alternatively embed literal reference bytes verified against those standard-library codecs. Preserve U+301C, U+FF71, the literal backslash in `\057`, and the exact supplementary code points named above. The expected edge text has an embedded CR in 漢字, a space before line 8's LF, and no terminator on its last line. Do not get any expected bytes from generated files or a previous generator run. A test-only helper may share these literal fixtures and standard-library encodings between tests, but no helper from the generator.
+
 | Test | Assert |
 |---|---|
 | `gen_testdata_root` | No arguments exits 0 and creates exactly the seven filenames listed above under the copied script's sibling testdata directory, not under the process working directory |
-| `gen_testdata_repeat` | A second generation exits 0 and produces byte-for-byte identical files |
-| `gen_testdata_check_matches` | After generation, `--check` exits 0 and leaves every file's bytes and modification time unchanged |
-| `gen_testdata_check_missing` | With one generated file removed, `--check` exits 1 and does not recreate it |
-| `gen_testdata_check_differs` | With basic.utf-8 replaced by `sentinel\n`, `--check` exits 1 and preserves the sentinel |
+| `gen_testdata_bytes_basic_euc_jp` | Generation exits 0; basic.euc-jp.jisyo equals the independently encoded literal cookie, B, and `こう /丂/\n` |
+| `gen_testdata_bytes_basic_euc_jis_2004` | Generation exits 0; basic.euc-jis-2004.jisyo equals the independently encoded literal cookie, B, and `ぱ /か゚/𠀋/𠂉/\n` |
+| `gen_testdata_bytes_nocookie_euc_jis_2004` | Generation exits 0; nocookie.euc-jis-2004.jisyo equals the independently encoded literal B and `ぱ /か゚/𠀋/𠂉/\n`, without a cookie |
+| `gen_testdata_bytes_basic_utf_8` | Generation exits 0; basic.utf-8.jisyo equals the independent UTF-8 bytes of its literal cookie, B, and `えもじ /😀/か゚/𠂉/丂/\n` |
+| `gen_testdata_bytes_bom_utf_8` | Generation exits 0; bom.utf-8.jisyo equals literal EF BB BF followed by the independent UTF-8 bytes of B and the emoji entry, with no cookie |
+| `gen_testdata_bytes_basic_utf_16le` | Generation exits 0; basic.utf-16le.jisyo equals literal FF FE followed by the independent UTF-16LE bytes of B and the emoji entry, with every LF replaced by CRLF |
+| `gen_testdata_bytes_edge_utf_8` | Generation exits 0; edge.utf-8.jisyo equals the UTF-8 bytes of the complete literal 11-line edge text, with its specified CR, LF, CRLF, trailing space, and unterminated last line |
+| `gen_testdata_repeat` | Invoke generation twice. After each invocation, compare every file to its independently specified expected bytes, never to the first invocation's output |
+| `gen_testdata_check_matches` | Seed all seven files with independently specified expected bytes, without first running the generator. `--check` exits 0 and leaves each file's bytes and modification time unchanged |
+| `gen_testdata_check_missing` | Seed the independently specified files except basic.utf-8.jisyo. `--check` exits 1 and does not create the missing file |
+| `gen_testdata_check_differs` | Seed independently specified files, but use `sentinel\n` for basic.utf-8.jisyo. `--check` exits 1 and preserves the sentinel |
 | `gen_testdata_bad_argument` | `--unknown` exits 2 with stderr `usage: gen-testdata.py [--check]\n` and creates no testdata directory |
 
 Unit tests in `src/text.rs`:
