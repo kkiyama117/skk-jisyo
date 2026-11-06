@@ -99,34 +99,41 @@ pub struct Profile {
     pub blocks: bool,
 }
 
+/// What a learning event does to one candidate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Op {
+pub enum LearnOp {
+    /// A new word was registered. It goes to the front of the list.
     Add,
+    /// A word was chosen. It moves to the front of the list.
     Promote,
+    /// A word was purged from the list.
     Delete,
+    /// Only the annotation changed. The position stays.
     Annotate,
 }
 
-/// One change to one candidate list. `okuri` is `None` for the main list of the entry.
+/// A learning event: the engine emits one each time it learns, and an import from an IME
+/// file produces the same events. It addresses one candidate of one list. `okuri` is `None`
+/// for the main list of the entry and `Some(okuri)` for a `[okuri/.../]` block.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Change {
-    pub op: Op,
+pub struct LearnEvent {
+    pub op: LearnOp,
     pub section: Section,
     pub midashi: String,
     pub okuri: Option<String>,
     pub candidate: Candidate,
 }
 
-/// A change as one line of a machine's log. `time` is milliseconds since the Unix epoch.
+/// A learning event as one line of a machine's log. `time` is milliseconds since the Unix epoch.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Event {
+pub struct LogRecord {
     pub machine: String,
     pub seq: u64,
     pub time: u64,
-    pub change: Change,
+    pub event: LearnEvent,
 }
 
-/// The only source of the current time. Milliseconds since the Unix epoch.
+/// The only source of the current time, used only outside the core. Milliseconds since the Unix epoch.
 pub trait Clock {
     fn now_ms(&self) -> u64;
 }

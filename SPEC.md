@@ -7,7 +7,18 @@
 1. **Formats.** Read and write SKK-JISYO text in EUC-JP, EUC-JIS-2004, UTF-8 (with or without BOM), and UTF-16LE (with BOM), so that reading a file and writing it back gives the same bytes. Turn a file into its meaning (a `Dict`) and a `Dict` into the user-dictionary file of CorvusSKK, fcitx5-skk, or skkeleton.
 2. **Store.** Keep the owner's user dictionary as one append-only log per machine in a folder that a file-sync tool copies between machines. Merging all logs gives the same `Dict` in any order. `sync` turns what an IME changed in its own file into log events, merges, and writes the merged dictionary back in that IME's format.
 
-The decisions above this spec are ADRs by `skk-design` (`/data/softwares/skk/docs/adr/`). The store part (sections "Log", "Merge", "Diff", "Store", and the `sync` and `repair-log` commands) is a proposal under review by `skk-design`. Its cards are not written yet.
+The decisions above this spec are ADRs by `skk-design` (`/data/softwares/skk/docs/adr/`). The store part follows ADR-0006, and `skk-design` reviewed it on 2026-11-06 (`local/agents/jisyo-store-review-answer.md` in the parent repository). `LearnEvent`, `LearnOp`, and `LogRecord` are the learning events of ADR-0009: the engine's `Output::Learn` carries a `jisyo::LearnEvent`.
+
+## Layers
+
+The code is split only where there are really two or more implementations. A layer uses only the layers above it in this table.
+
+| Layer | Modules | Rule |
+|---|---|---|
+| Core | `model`, `entry`, `dict`, `record`, `merge`, `diff` | Pure functions over the contract types, `&str`, and `&[u8]`. No files, no clock, no encoding tables, no knowledge of any IME. The engine will use this layer as it is: it emits `LearnEvent`s, and `merge` gives the user dictionary |
+| Formats | `encoding`, `text`, `ime` | Pure functions between bytes and the core types: the four encodings, the lossless file model, and one `Profile` per IME. A new encoding or a new IME changes this layer only |
+| Application | `sync` | The pure plan of one sync: given the bytes of every file and the time, return the bytes to write. All the guards live here |
+| Outside | `store`, `main` | The only code that touches the file system or the clock. It reads files, calls `sync::plan`, and writes the results. Another way to reach the synced folder changes this layer only |
 
 ## Owns, reads, writes
 
@@ -29,19 +40,23 @@ tools/gen-testdata.py       writes testdata/*.jisyo with Python codecs
 testdata/*.jisyo
 src/lib.rs                  module list
 src/model.rs                CONTRACT: public types and errors
-src/encoding.rs             Codec
-src/entry.rs                one entry line
-src/text.rs                 one file, losslessly
-src/dict.rs                 Dict from a file, profiles, rendering
-src/log.rs                  one machine's log            (store, proposed)
-src/merge.rs                merge of all logs            (store, proposed)
-src/diff.rs                 file changes to log changes  (store, proposed)
-src/store.rs                directory layout and sync    (store, proposed)
-src/main.rs                 CLI
+src/entry.rs                core: one entry line
+src/dict.rs                 core: Dict from a Jisyo
+src/record.rs               core: one log line, one log's bytes
+src/merge.rs                core: all records to a Dict
+src/diff.rs                 core: two Dicts to learning events
+src/encoding.rs             formats: Codec
+src/text.rs                 formats: bytes to Jisyo, losslessly
+src/ime.rs                  formats: profiles, Dict to an IME file
+src/sync.rs                 application: the plan of one sync
+src/store.rs                outside: directory layout, file writes
+src/main.rs                 outside: CLI
 tests/*.rs                  integration tests named by the cards
 ```
 
 `src/lib.rs` holds `pub mod model; pub use model::*;` and one `pub mod <name>;` line per module, which the card that adds the module appends.
+
+`tests/layers.rs` enforces the core rule in the gate. It reads each core source file with `include_str!` and asserts that none contains `crate::encoding`, `crate::text`, `crate::ime`, `crate::sync`, `crate::store`, `std::fs`, `std::time`, `std::env`, or `std::net`, and that none has a `use crate::{` group naming any of `encoding`, `text`, `ime`, `sync`, `store`. Each card that adds a core module adds its file to that list.
 
 ## Dependencies and licenses
 
@@ -57,7 +72,7 @@ tests/*.rs                  integration tests named by the cards
 
 ## Contract
 
-`src/model.rs` is the contract (first line `// CONTRACT: do not edit`). Read it before any card. It defines `Encoding`, `Eol`, `Section`, `Candidate`, `OkuriBlock`, `Entry`, `LineKind`, `Line`, `Jisyo`, `Dict`, `Target`, `Profile`, `Op`, `Change`, `Event`, the `Clock` trait, `ErrorCode`, and `Error`.
+`src/model.rs` is the contract (first line `// CONTRACT: do not edit`). Read it before any card. It defines `Encoding`, `Eol`, `Section`, `Candidate`, `OkuriBlock`, `Entry`, `LineKind`, `Line`, `Jisyo`, `Dict`, `Target`, `Profile`, `LearnOp`, `LearnEvent`, `LogRecord`, the `Clock` trait, `ErrorCode`, and `Error`.
 
 ## Errors
 
@@ -70,20 +85,20 @@ Every fallible public function returns `Result<_, Error>`. An `Error` carries a 
 | `encode` | A character has no code in the encoding. `line` (when writing a `Jisyo`) and `offset` (byte offset of the character in the UTF-8 text of that line, or of the whole text for `Codec::encode`) |
 | `unknown-coding` | The first line has a `coding:` cookie that names no encoding we know. `line` 1 |
 | `not-round-trip` | A file decodes, but encoding the text again does not give the same bytes. `offset` is the first differing byte offset in the file |
-| `bad-field` | A `Change` breaks a rule in "Field rules" |
+| `bad-field` | A `LearnEvent` breaks a rule in "Field rules" |
 | `bad-machine-id` | A machine ID breaks the rule in "Log" |
 | `log-header` | A log's first line is not the header. `line` |
 | `log-syntax` | A log line is malformed. `line` |
 | `log-seq` | A log's sequence numbers do not go 1, 2, 3, ... `line` |
 | `log-time` | A log's times do not strictly increase, or an append starts at or before the last time. `line` for a read |
-| `log-conflict` | Two events have the same machine and sequence number but differ |
+| `log-conflict` | Two records have the same machine and sequence number but differ |
 | `partial-tail` | The own log ends without a newline, so it cannot be appended to |
 | `too-many-deletes` | An import would delete more candidates than allowed. `count` is the number |
 | `target-missing` | A snapshot exists but the IME file does not |
 | `unparsed` | The IME file has lines that are neither blank, comment, marker, nor entry. `line` is the first, `count` the number |
 | `usage` | Bad CLI arguments |
 
-## Encodings (`src/encoding.rs`)
+## Encodings (`src/encoding.rs`, formats)
 
 ```rust
 pub struct Codec { /* private */ }
@@ -136,7 +151,7 @@ Aliases are used only for encoding, and only for characters that are not in that
 | `EucJis2004` | U+FFE3→A1B1, U+2015→A1BD, U+FFE5→A1EF, U+FFE0→A1F1, U+FFE1→A1F2, U+FFE2→A2CC |
 | `EucJp` | U+203E→A1B1, U+2014→A1BD, U+00A5→A1EF, U+2225→A1C2, U+FF0D→A1DD, U+FFE0→A1F1, U+FFE1→A1F2, U+FFE2→A2CC |
 
-Eleven of the 25 EUC-JIS-2004 pairs (codes 0xABC4–0xABCF, 0xABE5, 0xABE6: IPA letters with a combining accent or a tone letter) can also be written as two single codes. A file that uses the two single codes decodes to the same text, and encoding gives the pair code. `text::read` refuses such a file with `not-round-trip`. That is the intended behavior.
+Eleven of the 25 EUC-JIS-2004 pairs (0xABC4, 0xABC8, 0xABC9, 0xABCA, 0xABCB, 0xABCC, 0xABCD, 0xABCE, 0xABCF, 0xABE5, 0xABE6: IPA letters with a combining accent or a tone letter) can also be written as two single codes. The other 14 (kana with U+309A) cannot, because U+309A has no single code. A file that uses the two single codes decodes to the same text, and encoding gives the pair code. `text::read` refuses such a file with `not-round-trip`. That is the intended behavior.
 
 ### UTF-8 and UTF-16LE
 
@@ -153,7 +168,7 @@ Eleven of the 25 EUC-JIS-2004 pairs (codes 0xABC4–0xABCF, 0xABE5, 0xABE6: IPA 
 - Lines are in ascending order of the code as an unsigned integer. The file ends with a newline.
 - `python3 tools/gen-euc-jp.py` writes the file. `python3 tools/gen-euc-jp.py --check` builds the same text in memory and exits 1 if the file differs, else 0. The gate does not run the script, because the result depends on the glibc version.
 
-## One entry line (`src/entry.rs`)
+## One entry line (`src/entry.rs`, core)
 
 ```rust
 pub fn parse_candidate(token: &str) -> Candidate;
@@ -176,7 +191,7 @@ pub fn format_entry(entry: &Entry) -> String;
 6. A candidate token goes through `parse_candidate`. An empty `word` makes the line not an entry.
 7. Finally, `parse_entry` returns `Some` only when `format_entry` of the result equals `content`. Otherwise it returns `None`. This rule keeps entries lossless. A line with two spaces after the midashi, or with text after the last `/`, is `None`.
 
-## One file (`src/text.rs`)
+## One file (`src/text.rs`, formats)
 
 ```rust
 pub fn detect(bytes: &[u8]) -> Result<(Encoding, bool), Error>; // (encoding, has BOM)
@@ -216,7 +231,7 @@ Constants: the markers are exactly `;; okuri-ari entries.` and `;; okuri-nasi en
 
 **Lossless rule.** For any bytes that `read` accepts, `write(&read(bytes, f)?)` equals `bytes`.
 
-## Meaning of a file (`src/dict.rs`)
+## Meaning of a file (`src/dict.rs`, core) and IME files (`src/ime.rs`, formats)
 
 ```rust
 pub struct DictReport {
@@ -227,7 +242,14 @@ pub struct DictReport {
 }
 pub fn from_jisyo(jisyo: &Jisyo) -> DictReport;
 pub fn without_blocks(dict: &Dict) -> Dict;
+```
+
+`src/ime.rs` (formats):
+
+```rust
 pub fn profile(target: Target) -> Profile;
+pub fn target_name(target: Target) -> &'static str;   // "corvus", "fcitx5", "skkeleton"
+pub fn parse_target(name: &str) -> Option<Target>;    // the inverse of target_name
 pub struct Rendered { pub jisyo: Jisyo, pub skipped: u64 }
 pub fn render(dict: &Dict, profile: &Profile) -> Rendered;
 ```
@@ -251,92 +273,105 @@ A **list** is the main candidates of an entry, or the candidates of one block. I
 - a candidate whose `format_candidate` text cannot be encoded is dropped and adds 1;
 - a block left with no candidates is dropped, and an entry left with no candidates and no blocks is dropped. These add nothing more.
 
-## Store (proposed, under review by skk-design)
+## Store
 
-### Directory
+### Learning events
 
-```
-<store>/logs/<machine>.log                 one per machine, synced
-<store>/state/<machine>/<target>.jisyo     the last export for one target, written only by <machine>
-```
+A `LearnEvent` is one thing the owner taught the dictionary, addressed to one candidate of one list. The engine will emit them as the owner types. `diff` produces the same events from what an IME changed in its file. A `LogRecord` is a `LearnEvent` plus who wrote it (`machine`), its place in that machine's log (`seq`), and when (`time`). The core never reads a clock: the outside layer gives the time.
 
-`<target>` is `corvus`, `fcitx5`, or `skkeleton`. The sync tool may copy `state/` too. That does no harm, because only `<machine>` reads and writes its own folder.
+| `LearnOp` | Engine moment | Effect after `merge` |
+|---|---|---|
+| `Add` | a word is registered | present, at the front of its list |
+| `Promote` | a candidate is chosen and confirmed | present, at the front of its list |
+| `Delete` | a candidate is purged (`X`) | absent |
+| `Annotate` | an annotation is edited | the annotation changes, the position does not |
 
-### Log (`src/log.rs`)
+One keystroke can teach several lists. Confirming 動く for `うごk` is a `Promote` of 動 in the main list and a `Promote` of 動 in block `く`. The engine emits both, in that order.
+
+### Record (`src/record.rs`, core)
 
 ```rust
 pub const HEADER: &str = "jisyo-log 1";
 pub fn validate_machine_id(id: &str) -> Result<(), Error>;
-pub fn validate_change(change: &Change) -> Result<(), Error>;
-pub fn format_event(event: &Event) -> String;              // one line, without "\n"
-pub struct LogRead { pub events: Vec<Event>, pub partial_tail: bool }
+pub fn validate_event(event: &LearnEvent) -> Result<(), Error>;
+pub fn format_record(record: &LogRecord) -> String;            // one line, without "\n"
+pub struct LogRead { pub records: Vec<LogRecord>, pub partial_tail: bool, pub complete_len: usize }
 pub fn parse_log(machine: &str, bytes: &[u8]) -> Result<LogRead, Error>;
-pub fn append(path: &Path, machine: &str, changes: &[Change], first_time: u64) -> Result<Vec<Event>, Error>;
-pub fn repair(path: &Path) -> Result<u64, Error>;          // bytes removed
+pub struct Appended { pub bytes: Vec<u8>, pub records: Vec<LogRecord> }
+pub fn append_bytes(machine: &str, existing: Option<&[u8]>, events: &[LearnEvent], first_time: u64) -> Result<Appended, Error>;
 ```
 
 A machine ID matches `^[a-z0-9][a-z0-9-]{0,31}$`. Otherwise the error is `bad-machine-id`.
 
-**Field rules** (`validate_change`, else `bad-field`). These are exactly what an SKK line can hold:
+**Field rules** (`validate_event`, else `bad-field`). These are exactly what an SKK line can hold:
 
 - `midashi` is not empty, has no space and no `\n`, and does not start with `;`.
 - `okuri` is `None` in `OkuriNasi`. When it is `Some(k)`, `k` is not empty and has no `/`, `[`, `]`, or `\n`.
 - `candidate.word` is not empty and has no `/`, `;`, or `\n`. In `OkuriAri` it does not start with `[` and is not `]`.
 - `candidate.annotation`, when it is `Some`, has no `/` and no `\n`. A `Delete` has `annotation = None`.
 
-**File.** UTF-8. The first line is exactly `jisyo-log 1`. Every later line is one event, and every line ends with `\n`. An event line has 8 tab-separated fields:
+**File.** UTF-8. The first line is exactly `jisyo-log 1`. Every later line is one record, and every line ends with `\n`. A record line has 8 tab-separated fields:
 
 ```
 <machine>\t<seq>\t<time>\t<op>\t<section>\t<midashi>\t<okuri>\t<candidate>
 ```
 
-- `seq` and `time` are decimal, with no sign and no leading zero (except `0` itself), and fit in `u64`. `seq` is 1 for the first event and goes up by 1. `time` is milliseconds since the Unix epoch and strictly increases within a file.
+- `seq` and `time` are decimal, with no sign and no leading zero (except `0` itself), and fit in `u64`. `seq` is 1 for the first record and goes up by 1. `time` strictly increases within a file.
 - `op` is `add`, `promote`, `delete`, or `annotate`. `section` is `ari` or `nasi`.
 - `okuri` is empty for the main list. `candidate` is `format_candidate`.
 - The text fields (midashi, okuri, candidate) escape `\` as `\\`, tab as `\t`, LF as `\n`, and CR as `\r`. Any other `\x` is `log-syntax`. A raw CR anywhere in a line is `log-syntax`.
 
 `parse_log(machine, bytes)`:
 
-- The complete part is the bytes up to and including the last `\n`. The rest is a **partial tail**: a sync tool may have copied only part of the file. It is ignored, and `partial_tail` is set.
-- An empty complete part gives no events.
+- The complete part is the bytes up to and including the last `\n`, and `complete_len` is its length. The rest is a **partial tail**: a sync tool may have copied only part of the file. It is ignored, and `partial_tail` is set.
+- An empty complete part gives no records.
 - Otherwise the first line must be the header (else `log-header` line 1).
-- Each event line: invalid UTF-8, a field count other than 8, a machine field that is not `machine`, a bad number, op, section, or escape, or a field that breaks the field rules gives `log-syntax` with the line. A seq that is not the previous plus 1 gives `log-seq`. A time that is not greater than the previous gives `log-time`.
+- Each record line: invalid UTF-8, a field count other than 8, a machine field that is not `machine`, a bad number, op, section, or escape, or a field that breaks the field rules gives `log-syntax` with the line. A seq that is not the previous plus 1 gives `log-seq`. A time that is not greater than the previous gives `log-time`.
 
-`append(path, machine, changes, first_time)`:
+`append_bytes(machine, existing, events, first_time)` returns the bytes to append to the own log and the records they hold. The caller writes them.
 
-1. Validate the machine and every change first. On any error, write nothing.
-2. Empty `changes`: return `[]` and do not touch or create the file.
-3. If the file exists, `parse_log` it. A partial tail is `partial-tail`. Take the last seq and time, or 0 and 0 when there are no events.
+1. Validate the machine and every event first.
+2. Empty `events`: return no bytes and no records.
+3. With `existing = Some(bytes)`, `parse_log` them. A partial tail is `partial-tail`. Take the last seq and time, or 0 and 0 when there are no records.
 4. `first_time` must be greater than the last time (else `log-time`). Event `i` (0-based) gets `seq = last_seq + 1 + i` and `time = first_time + i`.
-5. Open the file for appending (creating it if missing). Write the header too if the file was missing or empty, and all event lines, with one `write_all`, then `sync_all`. Return the events.
+5. The bytes are the header line, when `existing` is `None` or empty, then one line per record.
 
-`repair(path)`: if the file is empty or ends with `\n`, return 0. Otherwise truncate it after its last `\n` (or to 0 bytes when it has none), `sync_all`, and return the number of bytes removed.
-
-### Merge (`src/merge.rs`)
+### Merge (`src/merge.rs`, core)
 
 ```rust
-pub fn merge(events: &[Event]) -> Result<Dict, Error>;
-pub fn next_time(now_ms: u64, events: &[Event]) -> u64;
+pub fn merge(records: &[LogRecord]) -> Result<Dict, Error>;
+pub fn apply(dict: &mut Dict, event: &LearnEvent);
+pub fn next_time(now_ms: u64, records: &[LogRecord]) -> u64;
 ```
 
-The result depends only on the set of events, never on their order. This is the property that lets any machine merge the logs in any order.
+The result depends only on the set of records, never on their order. This is the property that lets any machine merge the logs in any order.
 
-1. Events with the same `(machine, seq)` must be equal. A duplicate is used once. A pair that differs gives `log-conflict`.
-2. Events are ordered by `(time, machine, seq)`, with `machine` compared as bytes. "Latest" means greatest in this order.
+1. Records with the same `(machine, seq)` must be equal. A duplicate is used once. A pair that differs gives `log-conflict`.
+2. Records are ordered by `(time, machine, seq)`, with `machine` compared as bytes. "Latest" means greatest in this order.
 3. A candidate key is `(section, midashi, okuri, word)`. For each key:
-   - **presence** is the latest event among `Add`, `Promote`, and `Delete`. The candidate is present when there is one and it is not `Delete`. Its **rank** is that event's order key.
-   - **text** is the latest event among `Add`, `Promote`, and `Annotate`. The candidate's annotation is that event's annotation.
+   - **presence** is the latest record among `Add`, `Promote`, and `Delete`. The candidate is present when there is one and it is not `Delete`. Its **rank** is that record's order key.
+   - **text** is the latest record among `Add`, `Promote`, and `Annotate`. The candidate's annotation is that record's annotation.
    - An `Annotate` alone does not make a candidate present.
-4. Build the `Dict` from the present candidates. A list holds its candidates by rank, highest first. An entry's blocks are ordered by their highest rank, highest first. Each section's entries are ordered by the highest rank of any of their candidates, highest first. An entry exists when it has at least one present candidate.
+4. **touch.** An entry's touch is the latest record of any op with its `(section, midashi)`. A block's touch is the latest record of any op with its `(section, midashi, Some(okuri))`. Deletes and annotates count, so purging a word also brings its entry to the front, as using one does. Entry and block order never changes what a lookup returns. It only changes the order of lines in an export and the order of completions, so an entry that comes to the front after a delete does no harm.
+5. Build the `Dict` from the present candidates. A list holds its candidates by rank, highest first. An entry's blocks are ordered by touch, latest first. Each section's entries are ordered by touch, latest first. An entry exists when it has at least one present candidate, and a block when it has one.
+
+`apply(dict, event)` changes a `Dict` as one record later than every record behind it would. The engine's shell uses it to keep its in-memory dictionary current between merges (ADR-0009). In the event's section:
+
+- `Add` or `Promote`: create the entry if missing (at the end of the section; it moves next), and the block if the event has an `okuri` and the block is missing. Remove the candidate's word from its list if present, then insert the event's candidate at the front.
+- `Delete`: remove the word from its list if present. Remove a block left empty, then an entry left with no candidates and no blocks.
+- `Annotate`: if the word is in its list, set its annotation to the event's. Otherwise do nothing to the candidates.
+- Then, for every op, if the entry still exists, move it to the front of its section, and if the event has an `okuri` and that block still exists, move the block to the front of the entry's blocks.
+
+**apply rule.** For any records `R` and a record `r` later than all of them, `apply(&mut merge(R), &r.event)` gives `merge(R ∪ {r})`.
 
 `Add` and `Promote` have the same effect. Both say "this candidate is in the list, at the front, as of this time". The log keeps them apart for people reading it. A promote after a delete brings the candidate back, because the owner used it after deleting it.
 
-`next_time(now_ms, events)` is `max(now_ms, 1 + the greatest time in events)`, or `now_ms` when there are no events. An event that a machine writes after it has read another machine's event is therefore later than that event, even when the clocks disagree.
+`next_time(now_ms, records)` is `max(now_ms, 1 + the greatest time in records)`, or `now_ms` when there are no records. A record that a machine writes after it has read another machine's record is therefore later than that record, even when the clocks disagree.
 
-### Diff (`src/diff.rs`)
+### Diff (`src/diff.rs`, core)
 
 ```rust
-pub fn diff(old: &Dict, new: &Dict) -> Vec<Change>;
+pub fn diff(old: &Dict, new: &Dict) -> Vec<LearnEvent>;
 ```
 
 `old` is the last export (the snapshot). `new` is what the IME wrote since. The result, applied in order with increasing times, turns each list of `old` into the same list in `new`.
@@ -356,49 +391,93 @@ Move-to-front (ddskk, CorvusSKK, skkeleton) gives one `Promote` per use. libskk 
 
 The first entry of the file then gets the latest times, which keeps the most-recent-first entry order of CorvusSKK and ddskk. Within an entry, the main list is last, so it gets the entry's latest time.
 
-With `old` empty (the first import from an existing IME file), every change is `Add`, and `merge` of those events gives back `new` exactly, including entry and block order.
+With `old` empty (the first import from an existing IME file), every event is `Add`, and `merge` of those events gives back `new` exactly, including entry and block order.
 
-### Sync (`src/store.rs`)
+### Sync plan (`src/sync.rs`, application)
+
+```rust
+pub struct SyncInput<'a> {
+    pub machine: &'a str,
+    pub target: Target,
+    pub logs: &'a [LogRecord],          // every machine's records, own log included
+    pub own_log: Option<&'a [u8]>,      // the own log's bytes, None when the file is missing
+    pub snapshot: Option<&'a [u8]>,
+    pub seen: Option<&'a [u8]>,         // the IME file as the previous sync read it
+    pub ime_file: Option<&'a [u8]>,
+    pub max_deletes: u64,
+    pub skip_unparsed: bool,
+    pub now_ms: u64,
+}
+pub struct SyncReport { pub added: u64, pub promoted: u64, pub deleted: u64, pub annotated: u64, pub restored: u64, pub skipped: u64, pub bootstrap: bool }
+pub struct SyncPlan { pub log_append: Vec<u8>, pub output: Vec<u8>, pub seen: Option<Vec<u8>>, pub report: SyncReport }
+pub fn plan(input: &SyncInput) -> Result<SyncPlan, Error>;
+pub fn export_bytes(target: Target, logs: &[LogRecord]) -> Result<(Vec<u8>, u64), Error>; // bytes, skipped
+```
+
+`plan`, in this order. It is pure: any error means nothing is to be written.
+
+1. `p = profile(target)`.
+2. If there is a snapshot: `old = from_jisyo(&read(snapshot, None)?).dict`.
+3. If there is an IME file: `report = from_jisyo(&read(ime_file, None)?)`, `new = report.dict`. A snapshot without an IME file is `target-missing`. With neither, `old` and `new` are empty. An IME file without a snapshot sets `bootstrap`, and `old` is empty.
+4. **Unparsed guard.** If `report.other_lines` is not empty and `skip_unparsed` is false, return `unparsed` with the first line and the count. An entry that we cannot parse would otherwise look deleted.
+5. Without `p.blocks`, apply `without_blocks` to `old`, `new`, and the seen Dict below. `events = diff(&old, &new)`.
+6. **Restore guard.** The worst failure is an IME that saves its in-memory dictionary over our export without reloading it first. The words we had just delivered would then look deleted, and the deletes would spread to every machine. So: the **delivered** keys are the `(section, midashi, okuri, word)` keys of `old` that are not in `seen` (`from_jisyo(&read(seen, None)?).dict`). With a snapshot but no `seen`, every key of `old` counts as delivered. Drop every `Delete` event whose key is delivered, and count each in `restored`. The merge still has those words, so the output gives them back to the IME. If the owner really purged such a word right after it arrived, it comes back once, and the next purge is recorded, because by then it is in `seen`.
+7. **Delete guard.** If the number of `Delete` events left is greater than `max_deletes`, return `too-many-deletes` with the number. The CLI default is 10. This is the last net behind the restore guard.
+8. `appended = append_bytes(machine, own_log, &events, next_time(now_ms, logs))`.
+9. `merge` of `logs` plus `appended.records`, then `render` with `p`, then `write`. That is `output`. `skipped` is the render's count.
+10. `seen` in the plan is a copy of `ime_file` (`None` when there is no IME file).
+
+`export_bytes(target, logs)`: `merge`, `render` with the profile, `write`.
+
+### Store (`src/store.rs`, outside)
+
+```
+<store>/logs/<machine>.log                 one per machine, synced
+<store>/state/<machine>/<target>.jisyo       the last export for one target (the snapshot), written only by <machine>
+<store>/state/<machine>/<target>.seen.jisyo  the IME file as the last sync read it, written only by <machine>
+```
+
+`<target>` is `target_name(target)`. The sync tool may copy `state/` too. That does no harm, because only `<machine>` reads and writes its own folder.
 
 ```rust
 pub struct Store { /* dir, machine */ }
-pub struct Logs { pub events: Vec<Event>, pub ignored_files: u64, pub partial_tails: u64 }
+pub struct Logs { pub records: Vec<LogRecord>, pub ignored_files: u64, pub partial_tails: u64 }
 pub struct SyncOptions { pub target: Target, pub file: PathBuf, pub max_deletes: u64, pub skip_unparsed: bool, pub dry_run: bool }
-pub struct SyncReport { pub added: u64, pub promoted: u64, pub deleted: u64, pub annotated: u64, pub skipped: u64, pub written: bool, pub bootstrap: bool }
+pub struct SyncDone { pub report: SyncReport, pub written: bool }
 impl Store {
     pub fn open(dir: &Path, machine: &str) -> Result<Store, Error>; // validates the ID, creates logs/ and state/<machine>/
     pub fn log_path(&self) -> PathBuf;
     pub fn snapshot_path(&self, target: Target) -> PathBuf;
     pub fn read_logs(&self) -> Result<Logs, Error>;
-    pub fn sync(&self, options: &SyncOptions, clock: &dyn Clock) -> Result<SyncReport, Error>;
+    pub fn sync(&self, options: &SyncOptions, clock: &dyn Clock) -> Result<SyncDone, Error>;
     pub fn export(&self, target: Target, out: &Path) -> Result<u64, Error>; // returns skipped
+    pub fn repair_log(&self) -> Result<u64, Error>;                         // bytes removed
 }
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error>;
 ```
 
 `read_logs` reads every regular file in `logs/` whose name is `<id>.log` with a valid ID, through `parse_log(id, ...)`. Any other file adds 1 to `ignored_files`, which covers sync-tool conflict copies and temporary files. Each partial tail adds 1 to `partial_tails`.
 
-`sync`, in this order. Any error stops it before step 7, with nothing written:
+`sync`:
 
-1. `logs = read_logs()`. `p = profile(target)`.
-2. Read the snapshot, if there is one: `old = from_jisyo(read(snapshot, None)).dict`.
-3. Read the IME file, if there is one: `new_j = read(file, None)`, and `report = from_jisyo(&new_j)`. If a snapshot exists and the IME file does not, return `target-missing`. If neither exists, `old` and `new` are empty. If the file exists without a snapshot, `old` is empty and `bootstrap` is true.
-4. **Unparsed guard.** If `report.other_lines` is not empty and `skip_unparsed` is false, return `unparsed` with the first line and the count. An entry that we cannot parse would otherwise look deleted.
-5. Without `p.blocks`, apply `without_blocks` to both. `changes = diff(&old, &new)`.
-6. **Delete guard.** If the number of `Delete` changes is greater than `max_deletes`, return `too-many-deletes` with the number. The CLI default is 10. This stops the worst failure: an IME that saves its in-memory dictionary over our export without reloading it first. The words from other machines would then look deleted, and the deletes would spread to every machine.
-7. With `dry_run`, return the counts of the changes, with `written` false. Write nothing.
-8. `append(log_path, machine, &changes, next_time(clock.now_ms(), &logs.events))`.
-9. `merge` of the old events plus the new ones, then `render` with `p`, then `write`.
-10. Write the IME file with `write_atomic` unless its bytes are already equal. Set `written`.
-11. Then write the snapshot with `write_atomic`, with the same bytes. The order matters. If the process stops between steps 10 and 11, the next sync sees our own export as IME changes. Those changes repeat merged events and lose nothing. The other order could make the merged words look deleted.
+1. Read the logs, the own log's bytes, the snapshot, the seen file, and the IME file (a missing file is `None`). Build `SyncInput` with `clock.now_ms()`, and call `plan`. On error, write nothing.
+2. With `dry_run`, return the report with `written` false. Write nothing.
+3. Append `log_append` to the own log: open for append (create if missing), one `write_all`, `sync_all`.
+4. Write the IME file with `write_atomic` unless its bytes already equal `output`. Set `written`.
+5. Then write the snapshot with `write_atomic`, with `output`.
+6. Then, when the plan's `seen` is `Some`, write it to the seen file with `write_atomic`.
+
+The order matters. If the process stops between steps 4 and 5, the next sync sees our own export as IME changes. Those events repeat merged records and lose nothing. If it stops between 5 and 6, the older seen file makes more keys count as delivered, which can only drop deletes, never add them. Any other order could make the merged words look deleted.
 
 `write_atomic(path, bytes)`: write `<path>.jisyo-tmp` (create or truncate) in the same directory, `sync_all`, then rename it over `path`.
 
-`export(target, out)`: merge all logs, render with the profile, and `write_atomic` to `out`. It does not touch the log or a snapshot.
+`export(target, out)`: `export_bytes` of all logs, then `write_atomic` to `out`. It does not touch the log or a snapshot.
+
+`repair_log`: if the own log is missing, empty, or ends with `\n`, return 0. Otherwise truncate it after its last `\n` (or to 0 bytes when it has none), `sync_all`, and return the number of bytes removed.
 
 ### Operating notes (for PLAN step 4, not for cards)
 
-- An IME holds its dictionary in memory and rewrites the whole file. After `sync` writes the IME file, the IME must reload it before it saves again. skkeleton reloads when the file's mtime changes. libskk reloads when the ETag changes, and a stale ETag makes its save fail rather than overwrite. CorvusSKK's `imcrvmgr.exe` must be stopped before the file is written. The delete guard is the safety net, not the plan.
+- An IME holds its dictionary in memory and rewrites the whole file. After `sync` writes the IME file, the IME must reload it before it saves again. skkeleton reloads when the file's mtime changes. libskk reloads when the ETag changes, and a stale ETag makes its save fail rather than overwrite. CorvusSKK's `imcrvmgr.exe` must be stopped before the file is written. The restore and delete guards are the safety net, not the plan.
 - Writing the owner's real IME files needs the owner's approval (PLAN question 6).
 - `sync` stamps an IME's changes with the time of the import, not the time of the keystroke. Run it often, for example from a file watcher.
 
@@ -414,7 +493,7 @@ jisyo repair-log --store <dir> --machine <id>
 Output goes to stdout, one `<name> <value>` line per item, and contains only counts and names:
 
 - `check`: `encoding <euc-jp|euc-jis-2004|utf-8|utf-16le>`, `bom <yes|no>`, `lines <n>`, `entries <okuri-ari> <okuri-nasi>`, `comments <n>`, `other <n>`, then `round-trip ok` when `write(read(file))` equals the file's bytes, else `round-trip failed` and exit 1.
-- `sync`: `added`, `promoted`, `deleted`, `annotated`, `skipped` (numbers), `written <yes|no>`, `bootstrap <yes|no>`.
+- `sync`: `added`, `promoted`, `deleted`, `annotated`, `restored`, `skipped` (numbers), `written <yes|no>`, `bootstrap <yes|no>`.
 - `export`: `skipped <n>`.
 - `repair-log`: `removed <n>`.
 
