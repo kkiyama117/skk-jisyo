@@ -1,0 +1,13 @@
+[package]
+name = "jisyo"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "SKK dictionary files in four encodings, and a user-dictionary store with one append-only log per machine"
+publish = false
+
+[dependencies]
+lexopt = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
