@@ -7,7 +7,7 @@
 1. **Formats.** Read and write SKK-JISYO text in EUC-JP, EUC-JIS-2004, UTF-8 (with or without BOM), and UTF-16LE (with BOM), so that reading a file and writing it back gives the same bytes. Turn a file into its meaning (a `Dict`) and a `Dict` into the user-dictionary file of CorvusSKK, fcitx5-skk, or skkeleton.
 2. **Store.** Keep an append-only local log of this machine's learning and a local cache of records fetched from a personal server. The own log also holds records waiting to be sent. Fetched records retain their original machine, sequence number, and time. Merging the records available locally gives the same `Dict` for the same record set in any arrival order. Offline input and learning use this local state without waiting for the server. The existing `sync` operation imports changes from a local IME file and exports a merged file; it is not network synchronization.
 
-The decisions above this spec are ADRs by `skk-design` (`/data/softwares/skk/docs/adr/`). ADR-0006 proposes a personal server and a local record cache; its transport details remain Proposed, not an owner-approved wire protocol. This store revision follows that proposal and ADR-0009 section 4. `LearnEvent`, `LearnOp`, and `LogRecord` retain their existing shapes. The engine's `Output::Learn` carries a `jisyo::LearnEvent`. The server protocol, authentication, encryption, delivery acknowledgments, single-writer enforcement, and machine-ID recovery need separate specifications and review before transport cards run.
+The decisions above this spec are ADRs by `skk-design` (`/data/softwares/skk/docs/adr/`). ADR-0006 proposes a personal server and a local record cache; its transport details remain Proposed, not an owner-approved wire protocol. This store revision follows that proposal and ADR-0009 section 4. `LearnEvent`, `LearnOp`, and `LogRecord` retain their existing shapes. The engine's `Output::Learn` carries a `jisyo::LearnEvent`. ADR-0009 already requires one engine host per machine and user to own and serialize writes to the own log, including administrative import and repair; uncoordinated daemon and embedded writers may not share it. The Store contract below requires that log-owner exclusion. Only its enforcement mechanism, such as ownership acquisition versus routing a request through the host, remains later work under ADR-0009 line 63 and V1. The server protocol, authentication, encryption, delivery acknowledgments, and machine-ID recovery need separate specifications and review before transport cards run.
 
 ## Layers
 
@@ -80,7 +80,7 @@ Every fallible public function returns `Result<_, Error>`. An `Error` carries a 
 
 | Code | When |
 |---|---|
-| `io` | A file operation failed |
+| `io` | A file operation failed, or the log-owner exclusion is held by another writer. Ownership contention uses `io = Some(std::io::ErrorKind::WouldBlock)` as specified under "Own-log ownership" |
 | `decode` | Bytes are not valid in the encoding. `offset` is the byte offset in the file of the first byte of the bad sequence |
 | `encode` | A character has no code in the encoding. `line` (when writing a `Jisyo`) and `offset` (byte offset of the character in the UTF-8 text of that line, or of the whole text for `Codec::encode`) |
 | `unknown-coding` | The first line has a `coding:` cookie that names no encoding we know. `line` 1 |
@@ -361,7 +361,7 @@ The result depends only on the set of records, never on their order. This is the
 4. **touch.** An entry's touch is the latest record of any op with its `(section, midashi)`. A block's touch is the latest record of any op with its `(section, midashi, Some(okuri))`. Deletes and annotates count, so purging a word also brings its entry to the front, as using one does. Entry and block order never changes what a lookup returns. It only changes the order of lines in an export and the order of completions, so an entry that comes to the front after a delete does no harm.
 5. Build the `Dict` from the present candidates. A list holds its candidates by rank, highest first. An entry's blocks are ordered by touch, latest first. Each section's entries are ordered by touch, latest first. A block exists exactly when its own list has a present candidate. An entry exists exactly when its main list has a present candidate or at least one of its blocks exists. Candidates inside blocks therefore count for entry existence. An entry with an empty main list and a nonempty block is retained. An entry with neither main candidates nor nonempty blocks is omitted.
 
-`apply(dict, event)` changes a `Dict` as one record later than every record behind it would. The engine's shell uses it to keep its in-memory dictionary current between merges (ADR-0009). In the event's section:
+`apply(dict, event)` changes a `Dict` as one record later than every record behind it would. The engine host uses it to keep its in-memory dictionary current between merges (ADR-0009). In the event's section:
 
 - `Add` or `Promote`: create the entry if missing (at the end of the section; it moves next), and the block if the event has an `okuri` and the block is missing. Remove the candidate's word from its list if present, then insert the event's candidate at the front.
 - `Delete`: remove the word from its list if present. Remove a block left empty, then an entry left with no candidates and no blocks.
@@ -471,11 +471,21 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error>;
 
 `read_logs` reads every regular file in `logs/` whose name is `<id>.log` with a valid ID, through `parse_log(id, ...)`. This includes the own log and cached other-machine logs. It performs no server request and never changes record identity, payload, or time. Any other file adds 1 to `ignored_files`, covering temporary or unrelated files without assuming an external synchronization tool. Each partial tail adds 1 to `partial_tails`. Reading a partial own log does not authorize a later append to it; `append_bytes` still returns `partial-tail`.
 
+#### Own-log ownership
+
+The engine host is the sole normal owner of the own log for one machine and user, including across separate logon sessions. Only that owner may append, create, or truncate the own log. Learning, local IME import, and repair are serialized by the owner. A CLI must not directly modify a log owned by a running host; an eventual host-request route performs the actual Store operation inside that owner instead. A standalone caller may modify the log only after obtaining the same exclusive ownership when it is available. A daemon and an embedded host must not act as independent writers of the same log.
+
+Before a non-dry-run `Store::sync` reads the own-log state used for planning, it requires the log-owner exclusion. Keep that exclusion through assigning seq/time, sync step 3's append and sync_all, and the remaining writes of that operation. `repair_log` requires the same exclusion before inspecting or truncating the own log and keeps it through sync_all. A Store call inside the owning host uses its existing ownership and participates in its serialization; it must not release the host's lifetime ownership. `Store::open` alone grants no write ownership. Read-only calls and a dry-run sync do not acquire write ownership or authorize a later append.
+
+When another writer holds the exclusion, a direct non-dry-run sync or repair call fails immediately with the named **ownership-busy** result. It writes nothing, including no own-log creation, append, truncation, IME export, snapshot, seen file, or temporary output. This result uses the existing Error type: `code = ErrorCode::Io`, `io = Some(std::io::ErrorKind::WouldBlock)`, and `line`, `offset`, and `count` all None. Its Display is exactly `io io WouldBlock`. This names a contention case, not a new ErrorCode variant. The CLI reports it through its existing error path and exits 1; it must not report a successful sync or repair.
+
+The exclusion is a contract requirement now. The mechanism, including acquisition, lifetime management, and whether a management CLI obtains ownership or routes a request through the host, is specified and validated in later work under ADR-0009 line 63 and V1. This revision selects no lock-file format, IPC request, new ownership API, or platform security setting.
+
 `sync`:
 
 1. Read the locally cached logs, the own log's bytes, the snapshot, the seen file, and the IME file (a missing file is `None`). Build `SyncInput` with `clock.now_ms()` and this invocation's options, including `confirm_delivered_deletes`, and call `plan`. On error, write nothing. Do not contact the server or wait for an acknowledgment.
 2. With `dry_run`, return the report with `written` false. Write nothing.
-3. Append `log_append` to the own log: open for append (create if missing), one `write_all`, `sync_all`.
+3. With the log-owner exclusion already held as required above, append `log_append` to the own log: open for append (create if missing), one `write_all`, `sync_all`. No separate CLI or host may bypass that exclusion.
 4. Write the IME file with `write_atomic` unless its bytes already equal `output`. Set `written`.
 5. Then write the snapshot with `write_atomic`, with `output`.
 6. Then, when the plan's `seen` is `Some`, write it to the seen file with `write_atomic`.
@@ -486,7 +496,7 @@ The order matters. If the process stops between steps 4 and 5, the next sync see
 
 `export(target, out)`: `export_bytes` of all logs, then `write_atomic` to `out`. It does not touch the log or a snapshot.
 
-`repair_log`: if the own log is missing, empty, or ends with `\n`, return 0. Otherwise truncate it after its last `\n` (or to 0 bytes when it has none), `sync_all`, and return the number of bytes removed.
+`repair_log`: first require the log-owner exclusion defined above. Another writer's ownership returns ownership-busy without inspecting the file for a repair decision or writing anything. With the exclusion held, if the own log is missing, empty, or ends with `\n`, return 0. Otherwise truncate it after its last `\n` (or to 0 bytes when it has none), `sync_all`, and return the number of bytes removed. The owner serializes this whole inspection/truncation operation with learning and imports.
 
 ### Server-exchange boundary
 
@@ -557,6 +567,17 @@ Must fail without: recording the observed IME bytes rather than the export in se
 Must fail without: the explicit-confirmation exception for actual diff deletes → `plan_repeated_purge_confirmed_without_seen_presence`.
 Must fail without: the delete-count guard after confirmation → `plan_confirmation_keeps_delete_limit`.
 Must fail without: the unparsed-line guard → `plan_confirmation_keeps_unparsed_guard`.
+
+#### Log-owner exclusion (`tests/store.rs`)
+
+Use a unique temporary Store for machine a, target Skkeleton, and the literal E, P, and L bytes defined above. A test-controlled legitimate owner holds the exclusion for this exact own log throughout each tested call; the Store caller is a different writer, not a call inside that owner. Arrange the held ownership through the public ownership boundary specified by the later ADR-0009/V1 work. This test requirement chooses no acquisition API, lock-file format, or host-request protocol. Do not start a real engine host, patch a private Store helper, or substitute read-only file permissions or a sandbox denial for ownership contention. Other Store write tests run with ownership available or inside their legitimate test owner.
+
+| Test | Observable assertion through public Store |
+|---|---|
+| `store_sync_refuses_other_log_owner` | With another owner holding exclusion, seed own log L, snapshot P, seen P, IME E, clock 20, and ordinary non-dry-run sync options. Call Store::sync. It returns the ownership-busy Error with code Io and io Some(WouldBlock), with line/offset/count None. All four files retain their exact literal bytes and no output or temporary file is created. Without exclusion enforcement, this otherwise valid import would append a Delete, so a different early parse error must not satisfy the test |
+| `store_repair_refuses_other_log_owner` | With another owner holding exclusion, seed own-log bytes L followed by `b"a\t2"` and call Store::repair_log. It returns the same ownership-busy Error, leaves every byte including that partial tail intact, and creates no file. Without exclusion enforcement the repair would truncate the tail |
+
+Must fail without: log-owner exclusion before Store own-log writes → `store_sync_refuses_other_log_owner`, `store_repair_refuses_other_log_owner`.
 
 #### Local cache and outbox (`tests/store.rs`, `tests/merge.rs`)
 
