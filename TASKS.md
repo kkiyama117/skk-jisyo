@@ -1,6 +1,6 @@
 # jisyo tasks
 
-Do one card per run, in order. `src/model.rs`, `Cargo.toml`, `Cargo.lock`, `Makefile`, `.gitignore`, and `data/euc-jis-2004-std.txt` are never on a card's file list. The dependencies are already in `Cargo.toml`: `lexopt` and, for tests only, `tempfile`.
+Do one card per run. `src/model.rs`, `Cargo.toml`, `Cargo.lock`, `Makefile`, `.gitignore`, and `data/euc-jis-2004-std.txt` are never on a card's file list. The dependencies are already in `Cargo.toml`: `lexopt` and, for tests only, `tempfile`.
 
 For each module it adds, a card appends exactly one line `pub mod <name>;` to `src/lib.rs`, after the existing `pub mod` lines, and changes nothing else in that file. J5 adds two modules and therefore appends two lines, `pub mod dict;` followed by `pub mod ime;`.
 
@@ -450,3 +450,61 @@ The test Dict `D` used below is:
 The duplicate fixture is the literal UTF-8 text `";; okuri-ari entries.\nおおk /大/[く/多/]/\nおおk /多/大/[く/大/多/]/[き/大/]/\n;; okuri-nasi entries.\nかんじ /漢字/漢字;注/感じ/\nかんじ /幹事/感じ/\n"`. Read it through text::read before calling from_jisyo. A block-preserving EucJp profile means encoding EucJp, bom false, eol Lf, cookie None, blocks true. In all synthetic Dicts above, unspecified lists are empty and unspecified annotations are None.
 
 Done: `make check` exits 0.
+
+## J6. Pull-request and main-branch CI
+
+Tier: R1s
+
+Needs: nothing. The existing crate, Cargo.lock, and Makefile on main are sufficient. This card does not inherit or require the J1 implementation, J2-J5, or the store-contract branch.
+
+Spec: SPEC.md "Dependencies and licenses"; Cargo.toml; Cargo.lock; Makefile; `/data/softwares/skk/CLAUDE.md` "GitHub" and merge criteria; issue https://github.com/kkiyama117/kskk/issues/4.
+
+Files: `.github/workflows/check.yml` only. Its parent directories may be created. Do not edit Rust or Python code, dependency files, Makefile, toolchain files, TASKS.md, or test data.
+
+### Workflow contract
+
+Write a YAML workflow named `Jisyo check`. Its event mapping contains only unfiltered `pull_request` and `push` with `branches: [main]`. Do not add branch, path, or activity filters to pull_request. Do not use pull_request_target, schedule, workflow_run, or workflow_dispatch. Its only job has id `check`, name `make check`, `runs-on: ubuntu-24.04`, and `timeout-minutes: 10`. Do not add a matrix, container, services, job or step conditions, or continue-on-error at either level.
+
+Set root-level permissions to exactly `contents: read`. No job-level permissions key is allowed. Set the job environment variable `RUSTUP_TOOLCHAIN` to the literal string `'1.94.0'` and do not override it at step level. Do not set RUSTC_BOOTSTRAP or select a moving stable/nightly channel. The workflow has exactly these seven steps, in order:
+
+1. `Checkout`. Use `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` with end-of-line version comment `v7.0.1`. Set persist-credentials false and fetch-depth 1. Do not set ref, token, SSH key, submodules, or another repository. On pull_request, the default event checkout must test the head merged into the base main, not the head alone. On a main push it tests the pushed commit.
+2. `Set up Python`. Use `actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0` with end-of-line version comment `v7.1.0`. Set python-version to `'3.15.2'`, architecture to `'x64'`, and allow-prereleases false. Do not add a cache, mirror, or token, or fall back to the system Python.
+3. `Set up Rust`. Run exactly `rustup toolchain install 1.94.0 --profile minimal --component rustfmt --component clippy --no-self-update`. This uses the runner's rustup executable, not an additional action. Its failure must fail the job, including if rustup is absent. Do not add an unverified action SHA, installer download, alternate toolchain, or fallback. RUSTUP_TOOLCHAIN applies to the later version, fetch, and gate commands too.
+4. `Tool versions`. Run exactly `python3 --version && rustc --version && cargo --version`. The native log must identify Python 3.15.2 and stable rustc/cargo 1.94.0, not nightly. Do not suppress command failures.
+5. `Check iconv`. Run exactly `command -v iconv && iconv --version`. A missing or failing converter fails the job. Record its actual native version; do not require the local machine's glibc version or regenerate the real table in this step.
+6. `Fetch locked dependencies`. Run exactly `CARGO_NET_OFFLINE=false cargo fetch --locked` from the repository root. This is CI preparation for a fresh runner before the offline gate. It downloads only the dependencies selected by Cargo.lock and must fail rather than update the lock file. This command is written into the workflow, not executed by the implementer locally; AGENTS.md's local no-fetch rule still applies.
+7. `Run gate`. Run exactly `make check` from the repository root. Do not narrow it to selected tests, override CARGO_NET_OFFLINE to false, suppress its exit, or allow failure. The Makefile exports CARGO_NET_OFFLINE=true and runs fmt, clippy with warnings as errors, and cargo test.
+
+The two action/version pins and Python version match the locally checked conformance workflow at commit 988d9239fca0fae568a1bbddafafbc7e13c1b8f5. Stable Rust 1.94.0, its clippy and rustfmt components, and the full gate including J1's 16 tests were checked locally. Current crate and J1 code do not require nightly. This pin is a tested stable version, not a claim about the minimum supported Rust version or future unimplemented cards. No Rust setup action is needed, so this card has no unverified Rust action SHA.
+
+Python3 and iconv are explicit runner requirements. J1's CLI tests place the synthetic iconv double on a test child's PATH; they must not trigger real table regeneration during the gate. The actual GNU converter is still checked as a runner prerequisite. Do not add pip/apt installation, a package cache action, external engines, containers, real dictionaries, secrets, uploads, publication, or deployment. Network use by checkout, interpreter/toolchain setup, and locked dependency preparation is separate from the offline make check gate.
+
+### Verification
+
+Run the full `make check` locally with RUSTUP_TOOLCHAIN=1.94.0 and report its exit code and last 20 lines. Do not install or fetch a missing local toolchain, component, or crate; report that blocker. No new unittest, script, or fixture belongs to this card. The integration being added is native GitHub Actions running the existing public gate; comparing a YAML file with a second copy of itself would not test it.
+
+The names below are separate artifact or native-CI acceptance checks, not new Rust/Python test function names. An artifact assertion checks the written YAML. Native assertions require an actual Actions run and cannot be claimed from a local gate or a worker report.
+
+| Acceptance check | Observable assertion and evidence |
+|---|---|
+| `ci_events` | The only events are unfiltered pull_request and push with branches [main]. |
+| `ci_runner` | Exactly one check job uses ubuntu-24.04, name make check, and timeout 10, with no matrix, container, condition, or continue-on-error. |
+| `ci_action_pins` | Exactly two uses values have the complete action SHAs and version comments above. No Rust or cache action is added. |
+| `ci_readonly_token` | Root permissions are exactly contents read and no job-level override exists. |
+| `ci_no_persisted_credentials` | Checkout explicitly sets persist-credentials false and adds no credential input. |
+| `ci_pr_merge` | Checkout has no ref override. For the native PR run record the head SHA receiving the check, the base main commit, and the tested merge SHA. It must be the merge result, not a head-only checkout. |
+| `ci_python_version` | The native Tool versions log prints Python 3.15.2, matching the exact setup-python version and x64/non-prerelease settings. |
+| `ci_rust_toolchain` | The artifact pins job RUSTUP_TOOLCHAIN to 1.94.0 and installs minimal with clippy and rustfmt. The native version log prints stable rustc and cargo 1.94.0 with no bootstrap setting or fallback. |
+| `ci_iconv_available` | The native Check iconv step succeeds and logs the converter path/version before the gate. A YAML command alone does not prove availability. |
+| `ci_offline_gate_preparation` | Locked dependency fetch precedes the exact make check command, without modifying dependency/build files or turning off the Makefile's offline gate. |
+| `ci_pr_gate` | The card's pull_request run tests its merge result into main and executes the complete make check successfully. Record the run URL, PR head, base main commit, and tested merge SHA; skipped or selected-test-only execution does not pass. |
+| `ci_main_push_gate` | A native push-to-main run containing this workflow executes the same complete gate successfully. Record its run URL and main commit; a feature-branch push is not this evidence. |
+
+Must fail without: the explicit root read-only permissions declaration → `ci_readonly_token`.
+Must fail without: disabling persisted checkout credentials → `ci_no_persisted_credentials`.
+
+These guard-removal checks are assertions on the workflow artifact, not unittest runs. Removing each declaration must make its named artifact assertion fail. Restore the workflow byte-for-byte before any native run. Never send a deliberately weakened workflow to GitHub. Report artifact guard checks separately from local unit-test counts and native CI evidence.
+
+Open: none. All action SHAs and language-version choices used above have local evidence; native runner provisioning and execution remain acceptance checks, not assumed successes.
+
+Done for PR acceptance: the pinned local full gate exits 0, artifact checks hold, and the native pull_request gate succeeds on the merge result into main. The main-push check is post-merge completion evidence, not a prerequisite that can exist before that merge. Status: done additionally requires inclusion in origin/main and the successful native main-push run. Local success alone is not native CI evidence. No path outside Files is changed.
