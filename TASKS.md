@@ -12,7 +12,7 @@ SPEC.md "Layers" says which module may use which. A core module (`entry`, `dict`
 
 Tests use the public API (`jisyo::...`) unless a card says that a test is a unit test in the module's `#[cfg(test)] mod tests`. Byte strings in the tables below are hex, for example `A4 A2`. Strings use Rust escape syntax, for example `"\u{309A}"`.
 
-The store cards (J6 and later: log, merge, diff, sync, CLI) come after `skk-design` reviews the store part of `SPEC.md`.
+The store cards (log, merge, diff, sync, CLI) come after `skk-design` reviews the store part of `SPEC.md`.
 
 ## J1. EUC-JP table
 
